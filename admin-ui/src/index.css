@@ -1,0 +1,94 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --color-bg: 6 10 18;
+  --color-bg-2: 11 16 28;
+  --color-bg-3: 19 26 40;
+  --color-border: 47 62 88;
+  --color-text: 239 244 255;
+  --color-text-2: 145 160 188;
+  --color-accent: 255 92 98;
+  --color-accent-hover: 255 122 126;
+  --color-accent-2: 96 232 205;
+}
+
+html { background: rgb(var(--color-bg)); }
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: rgb(var(--color-text));
+  background: rgb(var(--color-bg));
+  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root { min-height: 100vh; }
+
+* {
+  scrollbar-color: rgba(96, 232, 205, 0.35) rgba(255, 255, 255, 0.04);
+  scrollbar-width: thin;
+}
+
+@layer base {
+  a { @apply text-text no-underline transition-colors duration-200 hover:text-accent; }
+
+  button {
+    @apply inline-flex items-center justify-center gap-2 rounded-sm border border-border
+      bg-bg-3 px-3 py-1.5 text-[13px] font-medium text-text transition-colors duration-200
+      hover:border-accent hover:text-white focus-visible:outline-none focus-visible:ring-2
+      focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-45;
+  }
+
+  input, select, textarea {
+    @apply rounded border border-border bg-bg-2 px-3 py-1.5 text-sm text-text outline-none
+      transition-colors duration-200 placeholder:text-text-2 focus:border-accent focus:ring-1
+      focus:ring-accent;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply border-transparent bg-accent text-white hover:bg-accent-hover hover:border-transparent;
+  }
+
+  .btn-ghost {
+    @apply border border-border bg-bg-3 text-text-2 hover:border-accent hover:text-text;
+  }
+
+  .surface {
+    @apply overflow-hidden rounded-[14px] border border-border;
+    background: rgb(var(--color-bg-2));
+  }
+
+  .nav-item {
+    @apply flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[12px] font-medium
+      text-text-2 transition-colors hover:bg-bg-3 hover:text-text cursor-pointer;
+  }
+
+  .nav-item-active {
+    @apply bg-bg-3 text-accent;
+  }
+
+  .nav-section-label {
+    @apply px-2.5 py-1 text-[10px] font-semibold uppercase tracking-widest text-text-2 opacity-50;
+  }
+
+  .tag {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium;
+  }
+
+  .spinner-sm {
+    @apply h-3.5 w-3.5 animate-spin rounded-full border-2 border-border border-t-accent;
+  }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

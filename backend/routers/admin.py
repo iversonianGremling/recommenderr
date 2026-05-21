@@ -1,4 +1,4 @@
-"""Admin UI endpoints — serve the test UI and provide diagnostic endpoints."""
+"""Admin UI — serve the React SPA and diagnostic endpoints."""
 from __future__ import annotations
 
 import os
@@ -6,21 +6,14 @@ import sqlite3
 from pathlib import Path
 
 from fastapi import APIRouter
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 DB_PATH = os.environ.get("DB_PATH", "/opt/recommenderr/data/recommenderr.db")
 ADMIN_UI_DIR = Path(__file__).parent.parent.parent / "admin-ui"
+DIST_DIR = ADMIN_UI_DIR / "dist"
+INDEX_HTML = DIST_DIR / "index.html"
 
 router = APIRouter()
-
-
-@router.get("", response_class=HTMLResponse)
-@router.get("/", response_class=HTMLResponse)
-async def admin_ui() -> HTMLResponse:
-    index = ADMIN_UI_DIR / "index.html"
-    if index.exists():
-        return HTMLResponse(index.read_text())
-    return HTMLResponse("<h1>recommenderr admin</h1><p>admin-ui/index.html not found</p>")
 
 
 @router.get("/status")
@@ -34,7 +27,7 @@ async def status() -> dict:
         tables = [
             "crawl_queue", "music_jobs", "recommendation_edges",
             "ppr_scores", "music_library", "artist_release_events",
-            "category_rec_jobs",
+            "category_rec_jobs", "sources", "items", "schemes",
         ]
         counts = {}
         for t in tables:
@@ -42,15 +35,29 @@ async def status() -> dict:
                 counts[t] = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
             except Exception:
                 counts[t] = None
-        # worker queue depths
         try:
-            pending = con.execute(
+            counts["crawl_queue_pending"] = con.execute(
                 "SELECT COUNT(*) FROM crawl_queue WHERE status='pending'"
             ).fetchone()[0]
-            counts["crawl_queue_pending"] = pending
         except Exception:
             pass
         con.close()
         return {"table_counts": counts}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# SPA catch-all: any path under /admin/ → serve dist/index.html.
+# Assets (/admin/assets/*) are served by the StaticFiles mount in main.py
+# and never reach this route.
+@router.get("", response_model=None)
+@router.get("/", response_model=None)
+@router.get("/{path:path}", response_model=None)
+async def spa(path: str = ""):
+    if INDEX_HTML.exists():
+        return FileResponse(INDEX_HTML, media_type="text/html")
+    # Fallback when SPA hasn't been built yet
+    return HTMLResponse(
+        "<h1>recommenderr admin</h1>"
+        "<p>Run <code>cd admin-ui && npm install && npm run build</code> to build the UI.</p>"
+    )

@@ -6,3 +6,4 @@ __pycache__/
 .env
 admin-ui/node_modules/
 admin-ui/dist/
+admin-ui/tsconfig.tsbuildinfo

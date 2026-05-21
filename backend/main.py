@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
@@ -20,6 +21,7 @@ LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9001"))
 DISABLE_WORKERS = os.environ.get("DISABLE_WORKERS", "0") == "1"
 SCHEMA_VERSION = 2
+ADMIN_ASSETS_DIR = Path(__file__).parent.parent / "admin-ui" / "dist" / "assets"
 
 
 def init_db() -> None:
@@ -97,6 +99,11 @@ app.include_router(ppr.router,       prefix="/v1/ppr",       tags=["ppr"])
 app.include_router(crawl.router,     prefix="/v1/crawl",     tags=["crawl"])
 app.include_router(items.router,     prefix="/v1/items",     tags=["items"])
 app.include_router(sources.router,   prefix="/v1/sources",   tags=["sources"])
+
+# Serve admin UI static assets if the SPA has been built.
+# Must be mounted BEFORE the admin router so /admin/assets/* doesn't hit the SPA catch-all.
+if ADMIN_ASSETS_DIR.exists():
+    app.mount("/admin/assets", StaticFiles(directory=ADMIN_ASSETS_DIR), name="admin-assets")
 
 # Legacy /api/ paths — mirror the monolith surface so nginx can drop the monolith fallback.
 # invidious.router at /api covers: /api/search, /api/trending, /api/channel/...,
