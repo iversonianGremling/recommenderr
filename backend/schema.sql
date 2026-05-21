@@ -493,3 +493,22 @@ CREATE TABLE IF NOT EXISTS item_aliases (
     PRIMARY KEY (alias_scheme, alias_external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_item_aliases_item ON item_aliases(item_id);
+
+-- ----- Source registry -----
+-- Declarative source state: code declares available sources, DB persists runtime state.
+-- Seeded on startup from source_registry.SOURCES_DECL via INSERT OR IGNORE.
+CREATE TABLE IF NOT EXISTS sources (
+    name                TEXT PRIMARY KEY,
+    display_name        TEXT NOT NULL,
+    kind                TEXT NOT NULL DEFAULT 'api',   -- api | scraper | extractor | feed
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    weight              REAL NOT NULL DEFAULT 1.0,
+    credentials_json    TEXT,                          -- {env_var: override_value} — write-only over HTTP
+    rate_limit_per_min  INTEGER,
+    last_success_at     REAL,
+    last_error_at       REAL,
+    last_error          TEXT,
+    failure_streak      INTEGER NOT NULL DEFAULT 0,
+    circuit_open_until  REAL,
+    metadata_json       TEXT                           -- env_var declarations, etc.
+);

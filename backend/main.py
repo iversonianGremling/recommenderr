@@ -39,6 +39,8 @@ def init_db() -> None:
         con.commit()
         from backend.services.migration import migrate_to_items_v1
         migrate_to_items_v1(con)
+        from backend.services.source_registry import seed_sources_table
+        seed_sources_table()
     finally:
         con.close()
 
@@ -81,7 +83,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from backend.routers import invidious, video, music, comments, radio, admin, artists, auth, ppr, crawl, items  # noqa: E402
+from backend.routers import invidious, video, music, comments, radio, admin, artists, auth, ppr, crawl, items, sources  # noqa: E402
 
 # Versioned API paths (internal / new clients)
 app.include_router(invidious.router, prefix="/v1/invidious", tags=["invidious"])
@@ -94,6 +96,7 @@ app.include_router(artists.router,   prefix="/v1/artists",   tags=["artists"])
 app.include_router(ppr.router,       prefix="/v1/ppr",       tags=["ppr"])
 app.include_router(crawl.router,     prefix="/v1/crawl",     tags=["crawl"])
 app.include_router(items.router,     prefix="/v1/items",     tags=["items"])
+app.include_router(sources.router,   prefix="/v1/sources",   tags=["sources"])
 
 # Legacy /api/ paths — mirror the monolith surface so nginx can drop the monolith fallback.
 # invidious.router at /api covers: /api/search, /api/trending, /api/channel/...,

@@ -18,6 +18,7 @@ import time
 from collections import deque
 
 from backend.db import get_db
+from backend.services import source_registry
 from backend.services.bandcamp_recommendations import (
     bandcamp_sidebar_to_music_recommendation_rows,
     get_shared_bandcamp_recommender,
@@ -42,45 +43,6 @@ CACHE_TTL_HOURS = float(os.getenv("RADIO_CACHE_TTL_HOURS", "48"))
 BANDCAMP_TTL_HOURS = float(os.getenv("RADIO_BANDCAMP_TTL_HOURS", "168"))
 MAX_SEEDS = int(os.getenv("RADIO_MAX_SEEDS", "5"))
 MAX_HOPS = 2
-
-# Circuit-breakers: mark yt-dlp/Invidious as unavailable after failures to avoid long hangs.
-_ytdlp_failed_until: float = 0.0
-_YTDLP_BACKOFF_SECS = 120.0
-
-_invidious_failed_until: float = 0.0
-_INVIDIOUS_BACKOFF_SECS = 60.0
-_invidious_fail_streak: int = 0
-_INVIDIOUS_FAIL_THRESHOLD = 2  # trip after this many consecutive failures
-
-
-def _ytdlp_available() -> bool:
-    return time.time() > _ytdlp_failed_until
-
-
-def _mark_ytdlp_failed() -> None:
-    global _ytdlp_failed_until
-    _ytdlp_failed_until = time.time() + _YTDLP_BACKOFF_SECS
-    logger.info("yt-dlp circuit-breaker: marked unavailable for %.0fs", _YTDLP_BACKOFF_SECS)
-
-
-def _invidious_available() -> bool:
-    return time.time() > _invidious_failed_until
-
-
-def _mark_invidious_failure() -> None:
-    global _invidious_failed_until, _invidious_fail_streak
-    _invidious_fail_streak += 1
-    if _invidious_fail_streak >= _INVIDIOUS_FAIL_THRESHOLD:
-        _invidious_failed_until = time.time() + _INVIDIOUS_BACKOFF_SECS
-        logger.info(
-            "Invidious circuit-breaker: tripped after %d failures, unavailable for %.0fs",
-            _invidious_fail_streak, _INVIDIOUS_BACKOFF_SECS,
-        )
-
-
-def _mark_invidious_ok() -> None:
-    global _invidious_fail_streak
-    _invidious_fail_streak = 0
 
 _MUSIC_API_SOURCES = frozenset({"spotify", "deezer", "lastfm", "itunes", "bandcamp"})
 
@@ -222,7 +184,7 @@ def _bc_lookup_store(seed_key: str, bandcamp_url: str | None) -> None:
 
 def _ytdlp_search_sync(q: str, n: int = 20) -> list[dict]:
     """Blocking yt-dlp ytsearch (IPv6-forced) — run in executor."""
-    if not _ytdlp_available():
+    if not source_registry.is_available("ytdlp"):
         return []
     import yt_dlp  # lazy import; only used here
     opts = {
@@ -236,10 +198,10 @@ def _ytdlp_search_sync(q: str, n: int = 20) -> list[dict]:
             result = ydl.extract_info(f"ytsearch{n}:{q}", download=False)
             entries = result.get("entries", []) if result else []
             if not entries:
-                _mark_ytdlp_failed()
+                source_registry.mark_failure("ytdlp")
             return entries
     except Exception:
-        _mark_ytdlp_failed()
+        source_registry.mark_failure("ytdlp")
         return []
 
 
@@ -263,10 +225,10 @@ async def _youtube_music_search(track: str, artist: str) -> list[dict]:
         return []
 
     # Try Invidious (fast when working)
-    if _invidious_available():
+    if source_registry.is_available("invidious"):
         try:
             results = await asyncio.wait_for(api_get("/search", {"q": q, "type": "video"}), timeout=5.0)
-            _mark_invidious_ok()
+            source_registry.mark_success("invidious")
             if isinstance(results, list):
                 out = []
                 for v in results[:20]:
@@ -289,10 +251,10 @@ async def _youtube_music_search(track: str, artist: str) -> list[dict]:
                 if out:
                     return out
         except Exception:
-            _mark_invidious_failure()
+            source_registry.mark_failure("invidious")
 
     # Fallback: yt-dlp direct search (IPv6; 10s total budget)
-    if not _ytdlp_available():
+    if not source_registry.is_available("ytdlp"):
         return []
     try:
         loop = asyncio.get_running_loop()
@@ -311,7 +273,7 @@ async def _youtube_music_search(track: str, artist: str) -> list[dict]:
                 out.append(rec)
         return out
     except asyncio.TimeoutError:
-        _mark_ytdlp_failed()
+        source_registry.mark_failure("ytdlp")
         return []
     except Exception:
         return []
@@ -414,20 +376,20 @@ async def _resolve_to_youtube(recs: list[dict]) -> list[dict]:
     async def _one(rec: dict) -> dict:
         async with sem:
             # Try Invidious (with short timeout + circuit-breaker)
-            if _invidious_available():
+            if source_registry.is_available("invidious"):
                 try:
                     hit = await asyncio.wait_for(try_resolve_youtube_match(rec), timeout=5.0)
                     if hit and hit.get("video_id"):
-                        _mark_invidious_ok()
+                        source_registry.mark_success("invidious")
                         merged = {**rec, **hit}
                         orig_src = rec.get("sources") or []
                         hit_src = [s for s in (hit.get("source") or "").split(",") if s]
                         merged["sources"] = list(dict.fromkeys(orig_src + hit_src))
                         merged["is_music_confirmed"] = _is_confirmed_music(merged)
                         return merged
-                    _mark_invidious_failure()
+                    source_registry.mark_failure("invidious")
                 except Exception:
-                    _mark_invidious_failure()
+                    source_registry.mark_failure("invidious")
 
             # Fallback: yt-dlp search
             t = (rec.get("track") or "").strip()
@@ -435,7 +397,7 @@ async def _resolve_to_youtube(recs: list[dict]) -> list[dict]:
             q = f"{a} {t}".strip()
             if not q:
                 return rec
-            if not _ytdlp_available():
+            if not source_registry.is_available("ytdlp"):
                 return rec
             try:
                 loop = asyncio.get_running_loop()

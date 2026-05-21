@@ -2,15 +2,19 @@ import os
 import httpx
 from typing import Optional
 
-INVIDIOUS_URL = os.getenv("INVIDIOUS_URL", "http://192.168.1.173:3000")
+_INVIDIOUS_URL_DEFAULT = os.getenv("INVIDIOUS_URL", "http://192.168.1.173:3000")
 
 _client: Optional[httpx.AsyncClient] = None
+_client_base_url: str = ""
 
 
 def get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(base_url=INVIDIOUS_URL, timeout=30.0)
+    global _client, _client_base_url
+    from backend.services.source_registry import get_credential
+    url = get_credential("invidious", "INVIDIOUS_URL") or _INVIDIOUS_URL_DEFAULT
+    if _client is None or _client.is_closed or url != _client_base_url:
+        _client = httpx.AsyncClient(base_url=url, timeout=30.0)
+        _client_base_url = url
     return _client
 
 

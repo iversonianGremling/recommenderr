@@ -1,4 +1,3 @@
-import os
 import asyncio
 import re
 from collections import defaultdict
@@ -17,6 +16,7 @@ from backend.services.music_client import (
 )
 from backend.services.invidious_client import api_get
 from backend.services.ppr_engine import compute_ppr
+from backend.services.source_registry import get_weight
 
 NON_MUSIC_VIDEO_RE = re.compile(
     r"\b(review|reaction|meme|shitpost|analysis|explained|podcast|interview|breakdown|parody|fancam|fan cam|edit|amv)\b",
@@ -26,15 +26,6 @@ CANONICAL_MUSIC_VIDEO_RE = re.compile(
     r"\b(official (?:music )?video|official audio|lyrics?|lyric video|visualizer|audio)\b",
     re.IGNORECASE,
 )
-SOURCE_WEIGHTS = {
-    "spotify": 1.0,
-    "deezer": 0.9,
-    "deezer_discography": 0.93,
-    "lastfm": 0.85,
-    "itunes": 0.55,
-}
-
-
 def _norm_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
 
@@ -53,7 +44,7 @@ def _source_confidence(item: dict) -> float:
         sources = [one] if one else []
     if not sources:
         return 0.0
-    avg_weight = sum(SOURCE_WEIGHTS.get(source, 0.5) for source in sources) / len(sources)
+    avg_weight = sum(get_weight(source) for source in sources) / len(sources)
     diversity_bonus = min(len(sources), 4) * 0.11
     consensus_bonus = min(float(item.get("_count") or 1), 5.0) * 0.04
     return round(min(1.0, (avg_weight * 0.62) + diversity_bonus + consensus_bonus), 3)

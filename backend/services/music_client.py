@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 
 import httpx
+from backend.services.source_registry import get_credential, with_source
 from urllib.parse import quote
 
 # ── MusicBrainz ────────────────────────────────────────────────────────────────
@@ -484,17 +485,18 @@ async def deezer_get_related_artists(artist_id, limit: int = 10) -> list[dict]:
 
 
 # ── Last.fm ────────────────────────────────────────────────────────────────────
-_LASTFM_KEY = os.getenv("LASTFM_KEY", "")
 
+@with_source("lastfm")
 async def lastfm_search_track(track: str, artist: str = "", limit: int = 5) -> list[dict]:
-    if not _LASTFM_KEY:
+    key = get_credential("lastfm", "LASTFM_KEY")
+    if not key:
         return []
     try:
         params: dict = {
             "method": "track.search",
             "track": track,
             "limit": limit,
-            "api_key": _LASTFM_KEY,
+            "api_key": key,
             "format": "json",
         }
         if artist:
@@ -514,8 +516,10 @@ async def lastfm_search_track(track: str, artist: str = "", limit: int = 5) -> l
         return []
 
 
+@with_source("lastfm")
 async def lastfm_get_similar_tracks(track: str, artist: str, limit: int = 10) -> list[dict]:
-    if not _LASTFM_KEY:
+    key = get_credential("lastfm", "LASTFM_KEY")
+    if not key:
         return []
     try:
         params = {
@@ -523,7 +527,7 @@ async def lastfm_get_similar_tracks(track: str, artist: str, limit: int = 10) ->
             "track": track,
             "artist": artist,
             "limit": limit,
-            "api_key": _LASTFM_KEY,
+            "api_key": key,
             "format": "json",
         }
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -543,13 +547,13 @@ async def lastfm_get_similar_tracks(track: str, artist: str, limit: int = 10) ->
 
 
 # ── Spotify ────────────────────────────────────────────────────────────────────
-_SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
-_SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 _spotify_token: dict = {"token": None, "expires": 0.0}
 
 
 async def _spotify_get_token() -> str | None:
-    if not _SPOTIFY_CLIENT_ID or not _SPOTIFY_CLIENT_SECRET:
+    client_id = get_credential("spotify", "SPOTIFY_CLIENT_ID")
+    client_secret = get_credential("spotify", "SPOTIFY_CLIENT_SECRET")
+    if not client_id or not client_secret:
         return None
     if _spotify_token["token"] and time.time() < _spotify_token["expires"] - 60:
         return _spotify_token["token"]
@@ -558,7 +562,7 @@ async def _spotify_get_token() -> str | None:
             r = await client.post(
                 "https://accounts.spotify.com/api/token",
                 data={"grant_type": "client_credentials"},
-                auth=(_SPOTIFY_CLIENT_ID, _SPOTIFY_CLIENT_SECRET),
+                auth=(client_id, client_secret),
             )
             r.raise_for_status()
             data = r.json()
@@ -754,16 +758,17 @@ async def spotify_get_recommendations(seed_track_ids: list[str], limit: int = 10
 
 
 # ── Discogs ────────────────────────────────────────────────────────────────────
-_DISCOGS_TOKEN = os.getenv("DISCOGS_TOKEN", "")
 
+@with_source("discogs")
 async def discogs_search(q: str, limit: int = 5) -> list[dict]:
-    if not _DISCOGS_TOKEN:
+    token = get_credential("discogs", "DISCOGS_TOKEN")
+    if not token:
         return []
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(
                 "https://api.discogs.com/database/search",
-                params={"q": q, "type": "release", "token": _DISCOGS_TOKEN, "per_page": limit},
+                params={"q": q, "type": "release", "token": token, "per_page": limit},
                 headers={"User-Agent": "YTFrontend/1.0"},
             )
             r.raise_for_status()
