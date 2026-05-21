@@ -19,21 +19,26 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9001"))
 DISABLE_WORKERS = os.environ.get("DISABLE_WORKERS", "0") == "1"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
     try:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA foreign_keys=ON")
         con.executescript(SCHEMA_PATH.read_text())
+        # Always mark base schema version 1 as applied (idempotent).
+        # migrate_to_items_v1 is responsible for bumping to version 2.
         con.execute(
-            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
-            (SCHEMA_VERSION, time.time()),
+            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (1, ?)",
+            (time.time(),),
         )
         con.commit()
+        from backend.services.migration import migrate_to_items_v1
+        migrate_to_items_v1(con)
     finally:
         con.close()
 
@@ -76,7 +81,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from backend.routers import invidious, video, music, comments, radio, admin, artists, auth, ppr, crawl  # noqa: E402
+from backend.routers import invidious, video, music, comments, radio, admin, artists, auth, ppr, crawl, items  # noqa: E402
 
 # Versioned API paths (internal / new clients)
 app.include_router(invidious.router, prefix="/v1/invidious", tags=["invidious"])
@@ -88,6 +93,7 @@ app.include_router(admin.router,     prefix="/admin",        tags=["admin"])
 app.include_router(artists.router,   prefix="/v1/artists",   tags=["artists"])
 app.include_router(ppr.router,       prefix="/v1/ppr",       tags=["ppr"])
 app.include_router(crawl.router,     prefix="/v1/crawl",     tags=["crawl"])
+app.include_router(items.router,     prefix="/v1/items",     tags=["items"])
 
 # Legacy /api/ paths — mirror the monolith surface so nginx can drop the monolith fallback.
 # invidious.router at /api covers: /api/search, /api/trending, /api/channel/...,

@@ -446,3 +446,50 @@ CREATE TABLE IF NOT EXISTS custom_categories (
     keywords TEXT NOT NULL DEFAULT "",
     created_at REAL
 );
+
+-- ----- PPR config (runtime-editable algorithm knobs) -----
+-- NOTE: this table is read by routers/ppr.py but was previously missing from
+-- schema.sql (it was created by hand in prod). Declaring it here ensures fresh
+-- DBs are fully initialised.
+CREATE TABLE IF NOT EXISTS ppr_config (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+-- ----- Item abstraction (schemes + generic item store) -----
+
+-- schemes: declares a content type and its field structure.
+-- Users can add new schemes via the admin UI; built-in ones are seeded on startup.
+CREATE TABLE IF NOT EXISTS schemes (
+    name         TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    description  TEXT,
+    fields_json  TEXT NOT NULL DEFAULT '[]',  -- [{name, type, label, required}]
+    created_at   REAL NOT NULL
+);
+
+-- items: one row per discrete piece of content, across all schemes.
+-- external_id is the scheme-internal natural key (video_id, artist_key, album_key…).
+-- metadata_json stores all scheme-declared field values.
+CREATE TABLE IF NOT EXISTS items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    scheme      TEXT NOT NULL REFERENCES schemes(name),
+    external_id TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    added_at    REAL NOT NULL,
+    UNIQUE(scheme, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_items_scheme     ON items(scheme);
+CREATE INDEX IF NOT EXISTS idx_items_added      ON items(added_at DESC);
+
+-- item_aliases: links two items that represent the same physical thing.
+-- E.g. a music_track and the yt_video that embeds it share an alias.
+-- Lets PPR attribute graph edges to either representation.
+CREATE TABLE IF NOT EXISTS item_aliases (
+    item_id          INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    alias_scheme     TEXT    NOT NULL,
+    alias_external_id TEXT   NOT NULL,
+    PRIMARY KEY (alias_scheme, alias_external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_item_aliases_item ON item_aliases(item_id);
