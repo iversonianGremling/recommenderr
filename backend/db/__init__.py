@@ -7,7 +7,11 @@ import time
 import random
 import re
 
-DB_PATH = os.getenv("DB_PATH", "/opt/ytfrontend/data/ytfrontend.db")
+_DB_PATH_DEFAULT = "/opt/recommenderr/data/recommenderr.db"
+
+
+def _db_path() -> str:
+    return os.getenv("DB_PATH", _DB_PATH_DEFAULT)
 
 
 def _norm_token(value: str | None) -> str:
@@ -31,13 +35,16 @@ def normalize_artist_key(artist_name: str | None) -> str:
     return _norm_token(artist_name)
 
 
-def _ensure_dir():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+def _ensure_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def get_db() -> sqlite3.Connection:
-    _ensure_dir()
-    conn = sqlite3.connect(DB_PATH)
+    path = _db_path()
+    _ensure_dir(path)
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
