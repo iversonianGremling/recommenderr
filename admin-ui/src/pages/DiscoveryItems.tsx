@@ -1,14 +1,14 @@
 import { useEffect, useState } from 'react'
 import type { Item, Scheme } from '../lib/types'
 import { listItems, listSchemes } from '../lib/api'
-import SchemeAwareTable from '../components/SchemeAwareTable'
+import { ItemTable, normalizeItem } from '../components/ItemTable'
 
-const PAGE = 50
+const PAGE = 100
 
 export default function DiscoveryItems() {
   const [schemes, setSchemes] = useState<Scheme[]>([])
   const [selectedScheme, setSelectedScheme] = useState<string>('')
-  const [q, setQ] = useState('')
+  const [serverQ, setServerQ] = useState('')
   const [inputQ, setInputQ] = useState('')
   const [items, setItems] = useState<Item[]>([])
   const [loading, setLoading] = useState(false)
@@ -16,66 +16,98 @@ export default function DiscoveryItems() {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    listSchemes().then(s => {
-      setSchemes(s)
-      if (s.length > 0) setSelectedScheme(s[0].name)
-    }).catch(e => setError(String(e)))
+    listSchemes()
+      .then((s) => {
+        setSchemes(s)
+        if (s.length > 0) setSelectedScheme(s[0].name)
+      })
+      .catch((e) => setError(String(e)))
   }, [])
 
   useEffect(() => {
     if (!selectedScheme) return
     setLoading(true)
     setError(null)
-    listItems({ scheme: selectedScheme, q: q || undefined, limit: PAGE, offset })
+    listItems({ scheme: selectedScheme, q: serverQ || undefined, limit: PAGE, offset })
       .then(setItems)
-      .catch(e => setError(String(e)))
+      .catch((e) => setError(String(e)))
       .finally(() => setLoading(false))
-  }, [selectedScheme, q, offset])
+  }, [selectedScheme, serverQ, offset])
 
-  const scheme = schemes.find(s => s.name === selectedScheme)
+  const normalized = items.map((i) => normalizeItem(i as unknown as Record<string, unknown>))
+
+  const pageToolbar = (
+    <div className="flex items-center gap-2 flex-wrap">
+      <select
+        value={selectedScheme}
+        onChange={(e) => { setSelectedScheme(e.target.value); setOffset(0) }}
+        className="input text-xs py-1"
+      >
+        {schemes.map((s) => (
+          <option key={s.name} value={s.name}>{s.display_name}</option>
+        ))}
+      </select>
+      <form
+        className="flex items-center gap-1"
+        onSubmit={(e) => { e.preventDefault(); setServerQ(inputQ); setOffset(0) }}
+      >
+        <input
+          value={inputQ}
+          onChange={(e) => setInputQ(e.target.value)}
+          placeholder="Server search…"
+          className="input text-xs py-1 w-40"
+        />
+        <button type="submit" className="btn text-xs py-1 px-2">Go</button>
+        {serverQ && (
+          <button
+            type="button"
+            className="btn text-xs py-1 px-2"
+            onClick={() => { setServerQ(''); setInputQ(''); setOffset(0) }}
+          >
+            Clear
+          </button>
+        )}
+      </form>
+      <div className="flex items-center gap-1">
+        <button
+          className="btn text-xs py-1 px-2"
+          disabled={offset === 0}
+          onClick={() => setOffset((o) => Math.max(0, o - PAGE))}
+        >
+          ←
+        </button>
+        <span className="text-[10px] text-text-2 whitespace-nowrap">
+          {offset + 1}–{offset + items.length}
+        </span>
+        <button
+          className="btn text-xs py-1 px-2"
+          disabled={items.length < PAGE}
+          onClick={() => setOffset((o) => o + PAGE)}
+        >
+          →
+        </button>
+      </div>
+    </div>
+  )
 
   return (
     <div>
-      <div className="mb-4 flex items-center gap-3 flex-wrap">
-        <h1 className="text-xl font-semibold text-text mr-2">Items</h1>
-        <select
-          value={selectedScheme}
-          onChange={e => { setSelectedScheme(e.target.value); setOffset(0) }}
-          className="text-sm"
-        >
-          {schemes.map(s => <option key={s.name} value={s.name}>{s.display_name}</option>)}
-        </select>
-        <form
-          onSubmit={e => { e.preventDefault(); setQ(inputQ); setOffset(0) }}
-          className="flex items-center gap-2"
-        >
-          <input
-            value={inputQ}
-            onChange={e => setInputQ(e.target.value)}
-            placeholder="Search…"
-            className="text-sm w-48"
-          />
-          <button type="submit" className="text-[12px]">Search</button>
-          {q && <button type="button" onClick={() => { setQ(''); setInputQ('') }} className="text-[12px]">Clear</button>}
-        </form>
-      </div>
+      <h1 className="page-title mb-4">Items</h1>
 
-      {error && <div className="rounded border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300 mb-3">{error}</div>}
+      {error && (
+        <div className="rounded border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300 mb-3">
+          {error}
+        </div>
+      )}
+      {loading && <p className="text-text-2 text-sm mb-2">Loading…</p>}
 
-      <div className="surface">
-        {loading
-          ? <div className="py-8 text-center text-text-2">Loading…</div>
-          : scheme
-            ? <SchemeAwareTable scheme={scheme} items={items} />
-            : null}
-      </div>
-
-      {/* Pagination */}
-      <div className="mt-3 flex items-center gap-3 text-[13px] text-text-2">
-        <button onClick={() => setOffset(o => Math.max(0, o - PAGE))} disabled={offset === 0} className="text-[12px]">← Prev</button>
-        <span>Showing {offset + 1}–{offset + items.length}</span>
-        <button onClick={() => setOffset(o => o + PAGE)} disabled={items.length < PAGE} className="text-[12px]">Next →</button>
-      </div>
+      <ItemTable
+        items={normalized}
+        defaultColumns={['thumbnail', 'title', 'id', 'scheme', 'duration', 'added_at']}
+        storageKey="discovery-items"
+        toolbar={pageToolbar}
+        emptyMessage="No items found."
+      />
     </div>
   )
 }

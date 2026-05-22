@@ -32,8 +32,9 @@ export function normalizeItem(raw: Record<string, any>): NormalizedItem {
     id: String(raw.video_id ?? raw.external_id ?? raw.id ?? ''),
     scheme: raw.scheme as string | undefined,
     item_id: raw.item_id as number | undefined,
-    title: (raw.title ?? meta.title ?? null) as string | null,
-    author: (raw.author ?? meta.author ?? null) as string | null,
+    // meta field aliases cover music schemes: track→title, artist→author, etc.
+    title: (raw.title ?? meta.title ?? meta.track ?? meta.album ?? meta.artist ?? null) as string | null,
+    author: (raw.author ?? meta.author ?? meta.artist ?? null) as string | null,
     author_id: (raw.author_id ?? meta.author_id ?? null) as string | null,
     thumbnail: (raw.thumbnail ?? meta.thumbnail ?? null) as string | null,
     duration: (raw.duration ?? meta.duration ?? null) as number | null,
