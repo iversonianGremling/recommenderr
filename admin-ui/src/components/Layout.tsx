@@ -16,6 +16,7 @@ const NAV = [
       { to: '/recommendation/scores', label: 'Scores' },
       { to: '/recommendation/weight-rules', label: 'Weight Rules' },
       { to: '/recommendation/filters', label: 'Filters' },
+      { to: '/recommendation/graph', label: 'Graph' },
     ],
   },
   {

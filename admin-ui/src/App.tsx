@@ -7,6 +7,7 @@ import RecommendationConfig from './pages/RecommendationConfig'
 import RecommendationScores from './pages/RecommendationScores'
 import RecommendationWeightRules from './pages/RecommendationWeightRules'
 import RecommendationFilters from './pages/RecommendationFilters'
+import RecommendationGraph from './pages/RecommendationGraph'
 import PersonasList from './pages/PersonasList'
 import PersonaEdit from './pages/PersonaEdit'
 import PersonaScores from './pages/PersonaScores'
@@ -25,6 +26,7 @@ export default function App() {
         <Route path="recommendation/scores" element={<RecommendationScores />} />
         <Route path="recommendation/weight-rules" element={<RecommendationWeightRules />} />
         <Route path="recommendation/filters" element={<RecommendationFilters />} />
+        <Route path="recommendation/graph" element={<RecommendationGraph />} />
         <Route path="personas" element={<PersonasList />} />
         <Route path="personas/:id/edit" element={<PersonaEdit />} />
         <Route path="personas/:id/scores" element={<PersonaScores />} />

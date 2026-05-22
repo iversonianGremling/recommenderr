@@ -424,6 +424,200 @@ async def ppr_graph_stats() -> dict:
     return await run_in_threadpool(_query)
 
 
+@router.get("/graph/subgraph")
+async def ppr_graph_subgraph(
+    mode: str = "top",
+    limit: int = 150,
+    center: str | None = None,
+    direction: str = "in",
+    min_weight: float = 0.0,
+) -> dict:
+    """
+    Return a renderable subgraph.
+
+    mode=top   — top-N PPR-scored videos (targets) + their heaviest source videos.
+    mode=ego   — BFS neighbourhood of `center`. direction=in|out|both.
+    mode=channel — aggregate all edges at channel level; nodes are channels.
+    """
+    limit = max(10, min(limit, 500))
+
+    def _meta(conn, ids: list[str]) -> dict[str, dict]:
+        if not ids:
+            return {}
+        ph = ",".join("?" * len(ids))
+        meta: dict[str, dict] = {}
+        for r in conn.execute(
+            f"SELECT video_id, title, author, thumbnail FROM watch_history WHERE video_id IN ({ph})", ids
+        ).fetchall():
+            meta[r["video_id"]] = dict(r)
+        for r in conn.execute(
+            f"SELECT video_id, title, author, thumbnail FROM feed_recommendations WHERE video_id IN ({ph}) GROUP BY video_id", ids
+        ).fetchall():
+            meta[r["video_id"]] = dict(r)
+        return meta
+
+    def _query_top():
+        from backend.db import get_db
+        conn = get_db()
+        n_targets = min(limit // 2, 100)
+        n_sources = limit - n_targets
+
+        target_rows = conn.execute(
+            "SELECT video_id, score FROM ppr_scores ORDER BY score DESC LIMIT ?", (n_targets,)
+        ).fetchall()
+        if not target_rows:
+            conn.close()
+            return {"nodes": [], "edges": [], "meta": {"mode": "top", "node_count": 0, "edge_count": 0}}
+
+        targets = {r["video_id"]: r["score"] for r in target_rows}
+        ph = ",".join("?" * len(targets))
+
+        source_rows = conn.execute(
+            f"""SELECT source_video_id, SUM(weight) as w FROM recommendation_edges
+                WHERE target_video_id IN ({ph}) AND weight >= ?
+                GROUP BY source_video_id ORDER BY w DESC LIMIT ?""",
+            list(targets) + [min_weight, n_sources],
+        ).fetchall()
+        sources = {r["source_video_id"]: r["w"] for r in source_rows if r["source_video_id"] not in targets}
+
+        all_ids = list(targets) + list(sources)
+        ph2 = ",".join("?" * len(all_ids))
+        edge_rows = conn.execute(
+            f"""SELECT source_video_id as s, target_video_id as t, weight as w
+                FROM recommendation_edges
+                WHERE source_video_id IN ({ph2}) AND target_video_id IN ({ph2}) AND weight >= ?
+                ORDER BY weight DESC LIMIT 5000""",
+            all_ids + all_ids + [min_weight],
+        ).fetchall()
+
+        m = _meta(conn, all_ids)
+        conn.close()
+
+        nodes = [
+            {"id": vid, "label": m.get(vid, {}).get("title") or vid,
+             "author": m.get(vid, {}).get("author"), "thumbnail": m.get(vid, {}).get("thumbnail"),
+             "score": score, "type": "target"}
+            for vid, score in targets.items()
+        ] + [
+            {"id": vid, "label": m.get(vid, {}).get("title") or vid,
+             "author": m.get(vid, {}).get("author"), "thumbnail": m.get(vid, {}).get("thumbnail"),
+             "score": None, "edge_weight": w, "type": "source"}
+            for vid, w in sources.items()
+        ]
+        edges = [{"source": r["s"], "target": r["t"], "weight": r["w"]} for r in edge_rows]
+        return {"nodes": nodes, "edges": edges,
+                "meta": {"mode": "top", "node_count": len(nodes), "edge_count": len(edges)}}
+
+    def _query_ego():
+        if not center:
+            raise HTTPException(400, "center required for ego mode")
+        from backend.db import get_db
+        conn = get_db()
+
+        visited: set[str] = {center}
+        all_edges: list[dict] = []
+        frontier: set[str] = {center}
+
+        for _ in range(2):
+            if len(visited) >= limit or not frontier:
+                break
+            ph = ",".join("?" * len(frontier))
+            new_nodes: set[str] = set()
+
+            if direction in ("out", "both"):
+                for r in conn.execute(
+                    f"SELECT source_video_id as s, target_video_id as t, weight as w "
+                    f"FROM recommendation_edges WHERE source_video_id IN ({ph}) AND weight >= ? "
+                    f"ORDER BY weight DESC LIMIT ?",
+                    list(frontier) + [min_weight, limit * 4],
+                ).fetchall():
+                    if len(visited) < limit and r["t"] not in visited:
+                        new_nodes.add(r["t"]); visited.add(r["t"])
+                    all_edges.append({"source": r["s"], "target": r["t"], "weight": r["w"]})
+
+            if direction in ("in", "both"):
+                for r in conn.execute(
+                    f"SELECT source_video_id as s, target_video_id as t, weight as w "
+                    f"FROM recommendation_edges WHERE target_video_id IN ({ph}) AND weight >= ? "
+                    f"ORDER BY weight DESC LIMIT ?",
+                    list(frontier) + [min_weight, limit * 4],
+                ).fetchall():
+                    if len(visited) < limit and r["s"] not in visited:
+                        new_nodes.add(r["s"]); visited.add(r["s"])
+                    all_edges.append({"source": r["s"], "target": r["t"], "weight": r["w"]})
+
+            frontier = new_nodes
+
+        scores = {r["video_id"]: r["score"] for r in conn.execute(
+            f"SELECT video_id, score FROM ppr_scores WHERE video_id IN ({','.join('?' * len(visited))})",
+            list(visited),
+        ).fetchall()}
+        m = _meta(conn, list(visited))
+        conn.close()
+
+        def ntype(vid: str) -> str:
+            if vid == center: return "center"
+            if vid in scores: return "scored"
+            return "neighbor"
+
+        nodes = [
+            {"id": vid, "label": m.get(vid, {}).get("title") or vid,
+             "author": m.get(vid, {}).get("author"), "thumbnail": m.get(vid, {}).get("thumbnail"),
+             "score": scores.get(vid), "type": ntype(vid)}
+            for vid in visited
+        ]
+        seen: set[tuple] = set()
+        edges = []
+        for e in all_edges:
+            k = (e["source"], e["target"])
+            if k not in seen and e["source"] in visited and e["target"] in visited:
+                seen.add(k); edges.append(e)
+        return {"nodes": nodes, "edges": edges,
+                "meta": {"mode": "ego", "center": center, "node_count": len(nodes), "edge_count": len(edges)}}
+
+    def _query_channel():
+        from backend.db import get_db
+        conn = get_db()
+        rows = conn.execute(
+            """
+            WITH top_edges AS (
+                SELECT source_video_id, target_video_id, weight
+                FROM recommendation_edges WHERE weight >= ?
+                ORDER BY weight DESC LIMIT 200000
+            )
+            SELECT fs.author AS src, ft.author AS tgt,
+                   SUM(te.weight) AS w, COUNT(*) AS cnt
+            FROM top_edges te
+            JOIN (SELECT video_id, author FROM feed_recommendations GROUP BY video_id) fs
+                ON fs.video_id = te.source_video_id
+            JOIN (SELECT video_id, author FROM feed_recommendations GROUP BY video_id) ft
+                ON ft.video_id = te.target_video_id
+            WHERE fs.author IS NOT NULL AND ft.author IS NOT NULL AND fs.author != ft.author
+            GROUP BY src, tgt ORDER BY w DESC LIMIT ?
+            """,
+            (min_weight, limit * 3),
+        ).fetchall()
+        conn.close()
+
+        channels: set[str] = set()
+        edges = []
+        for r in rows:
+            channels.add(r["src"]); channels.add(r["tgt"])
+            edges.append({"source": r["src"], "target": r["tgt"], "weight": r["w"], "edge_count": r["cnt"]})
+            if len(channels) >= limit:
+                break
+
+        edges = [e for e in edges if e["source"] in channels and e["target"] in channels]
+        nodes = [{"id": ch, "label": ch, "type": "channel"} for ch in channels]
+        return {"nodes": nodes, "edges": edges,
+                "meta": {"mode": "channel", "node_count": len(nodes), "edge_count": len(edges)}}
+
+    fn = {"top": _query_top, "ego": _query_ego, "channel": _query_channel}.get(mode)
+    if fn is None:
+        raise HTTPException(400, "mode must be top | ego | channel")
+    return await run_in_threadpool(fn)
+
+
 # ---------------------------------------------------------------------------
 # Feed filters
 # ---------------------------------------------------------------------------
