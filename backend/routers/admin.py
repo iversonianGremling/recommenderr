@@ -50,14 +50,18 @@ async def status() -> dict:
 # SPA catch-all: any path under /admin/ → serve dist/index.html.
 # Assets (/admin/assets/*) are served by the StaticFiles mount in main.py
 # and never reach this route.
+_NO_CACHE = {"Cache-Control": "no-store"}
+
+
 @router.get("", response_model=None)
 @router.get("/", response_model=None)
 @router.get("/{path:path}", response_model=None)
 async def spa(path: str = ""):
     if INDEX_HTML.exists():
-        return FileResponse(INDEX_HTML, media_type="text/html")
+        return FileResponse(INDEX_HTML, media_type="text/html", headers=_NO_CACHE)
     # Fallback when SPA hasn't been built yet
     return HTMLResponse(
         "<h1>recommenderr admin</h1>"
-        "<p>Run <code>cd admin-ui && npm install && npm run build</code> to build the UI.</p>"
+        "<p>Run <code>cd admin-ui && npm install && npm run build</code> to build the UI.</p>",
+        headers=_NO_CACHE,
     )

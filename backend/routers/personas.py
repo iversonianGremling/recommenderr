@@ -280,14 +280,9 @@ async def get_persona_scores(persona_id: int, limit: int = 100) -> list:
         rows = conn.execute(
             """
             SELECT ps.video_id, ps.score, ps.spam_mass, ps.computed_at,
-                   COALESCE(fr.title, wh.title, pv.title) as title,
-                   COALESCE(fr.author, wh.author, pv.author) as author,
-                   COALESCE(fr.thumbnail, wh.thumbnail, pv.thumbnail) as thumbnail,
-                   COALESCE(fr.duration, wh.duration, pv.duration) as duration
+                   fr.title, fr.author, fr.thumbnail, fr.duration
             FROM persona_scores ps
             LEFT JOIN feed_recommendations fr ON fr.video_id = ps.video_id
-            LEFT JOIN watch_history wh ON wh.video_id = ps.video_id
-            LEFT JOIN playlist_videos pv ON pv.video_id = ps.video_id
             WHERE ps.persona_id = ?
             GROUP BY ps.video_id
             ORDER BY ps.score DESC
