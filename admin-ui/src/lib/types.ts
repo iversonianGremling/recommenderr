@@ -37,3 +37,65 @@ export interface Item {
   added_at: number
   aliases?: Array<{ alias_scheme: string; alias_external_id: string }>
 }
+
+export interface PprConfig {
+  watch_base: number
+  playlist_base: number
+  feed_rec_base: number
+  alpha: number
+  min_seed_rating: number
+  compute_spam_mass: number
+  _defaults: Record<string, number>
+}
+
+export interface PprScore {
+  video_id: string
+  score: number
+  spam_mass: number | null
+  computed_at: number | null
+  title: string | null
+  author: string | null
+}
+
+export interface PprSeed {
+  video_id: string
+  weight: number
+  title: string | null
+  author: string | null
+  reasons: string[]
+}
+
+export interface GraphStats {
+  nodes: number
+  edges: number
+  density: number
+  scored_nodes: number
+}
+
+export interface WeightRule {
+  id: number
+  rule_type: string
+  match_value: string
+  multiplier: number
+  created_at: number
+}
+
+export interface FeedFilter {
+  id: number
+  filter_type: string
+  match_value: string
+  created_at: number
+}
+
+export interface WhyResult {
+  video_id: string
+  title?: string
+  author?: string
+  score?: number
+  contributions?: Array<{
+    source: string
+    weight: number
+    reason: string
+  }>
+  [key: string]: unknown
+}

@@ -54,12 +54,45 @@ body {
 }
 
 @layer components {
+  .btn {
+    /* inherits base button styles via @layer base button */
+  }
+
   .btn-primary {
     @apply border-transparent bg-accent text-white hover:bg-accent-hover hover:border-transparent;
   }
 
+  .btn-accent {
+    @apply border-accent2 text-accent2 hover:bg-accent2 hover:text-bg;
+  }
+
   .btn-ghost {
     @apply border border-border bg-bg-3 text-text-2 hover:border-accent hover:text-text;
+  }
+
+  .page-title {
+    @apply text-base font-semibold text-text;
+  }
+
+  .label {
+    @apply block text-xs font-medium text-text-2 mb-1;
+  }
+
+  .input {
+    /* inherits base input styles */
+    @apply block;
+  }
+
+  .th {
+    @apply px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-text-2 border-b border-border;
+  }
+
+  .td {
+    @apply px-3 py-2 text-xs text-text border-b border-border;
+  }
+
+  .tr {
+    @apply hover:bg-bg-3 transition-colors;
   }
 
   .surface {

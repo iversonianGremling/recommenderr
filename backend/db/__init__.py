@@ -1048,6 +1048,34 @@ def delete_video_media_override(video_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Feed filters
+# ---------------------------------------------------------------------------
+
+def get_feed_filters():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM feed_filters ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_feed_filter(filter_type: str, match_value: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO feed_filters (filter_type, match_value, created_at) VALUES (?,?,?)",
+        (filter_type, match_value, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_feed_filter(filter_id: int):
+    conn = get_db()
+    conn.execute("DELETE FROM feed_filters WHERE id = ?", (filter_id,))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Category helpers (for category_recs)
 # ---------------------------------------------------------------------------
 

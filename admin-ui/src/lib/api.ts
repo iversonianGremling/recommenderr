@@ -1,4 +1,4 @@
-import type { Item, Scheme, Source } from './types'
+import type { FeedFilter, GraphStats, Item, PprConfig, PprScore, PprSeed, Scheme, Source, WeightRule, WhyResult } from './types'
 
 const BASE = ''  // same origin; empty → relative URLs work with Vite proxy and in production
 
@@ -48,6 +48,51 @@ export const getItem = (id: number) => req<Item>(`/v1/items/${id}`)
 // ── Admin status ─────────────────────────────────────────────────────────────
 
 export const getStatus = () => req<Record<string, unknown>>('/admin/status')
+
+// ── PPR ───────────────────────────────────────────────────────────────────────
+
+export const getPprConfig = () => req<PprConfig>('/v1/ppr/config')
+
+export const putPprConfig = (body: Partial<Omit<PprConfig, '_defaults'>>) =>
+  req<{ ok: boolean; updated: string[] }>('/v1/ppr/config', { method: 'PUT', body: JSON.stringify(body) })
+
+export const resetPprConfig = () =>
+  req<{ ok: boolean }>('/v1/ppr/config/reset', { method: 'POST' })
+
+export const recomputePpr = (body: { min_seed_rating?: number; compute_spam_mass?: boolean }) =>
+  req<{ ok: boolean; elapsed_seconds: number; items: number }>('/v1/ppr/recompute', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+
+export const invalidatePpr = () =>
+  req<{ ok: boolean }>('/v1/ppr/invalidate', { method: 'POST' })
+
+export const getPprScores = (limit = 100) =>
+  req<PprScore[]>(`/v1/ppr/scores?limit=${limit}`)
+
+export const getPprSeeds = (limit = 200) =>
+  req<PprSeed[]>(`/v1/ppr/seeds?limit=${limit}`)
+
+export const getGraphStats = () => req<GraphStats>('/v1/ppr/graph/stats')
+
+export const getPprWhy = (videoId: string) => req<WhyResult>(`/v1/ppr/why/${encodeURIComponent(videoId)}`)
+
+export const listWeightRules = () => req<WeightRule[]>('/v1/ppr/weight-rules')
+
+export const addWeightRule = (body: { rule_type: string; match_value: string; multiplier: number }) =>
+  req<{ ok: boolean }>('/v1/ppr/weight-rules', { method: 'POST', body: JSON.stringify(body) })
+
+export const deleteWeightRule = (id: number) =>
+  req<{ ok: boolean }>(`/v1/ppr/weight-rules/${id}`, { method: 'DELETE' })
+
+export const listFeedFilters = () => req<FeedFilter[]>('/v1/ppr/feed-filters')
+
+export const addFeedFilter = (body: { filter_type: string; match_value: string }) =>
+  req<{ ok: boolean }>('/v1/ppr/feed-filters', { method: 'POST', body: JSON.stringify(body) })
+
+export const deleteFeedFilter = (id: number) =>
+  req<{ ok: boolean }>(`/v1/ppr/feed-filters/${id}`, { method: 'DELETE' })
 
 // ── Raw search proxy ─────────────────────────────────────────────────────────
 

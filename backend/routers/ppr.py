@@ -302,8 +302,9 @@ async def list_weight_rules() -> list:
 @router.post("/weight-rules")
 async def add_weight_rule(body: WeightRuleRequest) -> dict:
     from backend.db import add_weight_rule
-    if body.rule_type not in ("keyword", "channel_id", "channel_name"):
-        raise HTTPException(status_code=400, detail="Invalid rule_type")
+    _VALID_RULE_TYPES = {"keyword", "channel_id", "channel_name", "genre", "category", "attribute"}
+    if body.rule_type not in _VALID_RULE_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid rule_type; allowed: {sorted(_VALID_RULE_TYPES)}")
     if not body.match_value.strip():
         raise HTTPException(status_code=400, detail="match_value required")
     if body.multiplier <= 0:
@@ -318,6 +319,144 @@ async def add_weight_rule(body: WeightRuleRequest) -> dict:
 async def delete_weight_rule(rule_id: int) -> dict:
     from backend.db import delete_weight_rule
     await run_in_threadpool(delete_weight_rule, rule_id)
+    from backend.services import feed_cache
+    feed_cache._snapshot.computed_at = 0.0
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Seeds (current personalization vector)
+# ---------------------------------------------------------------------------
+
+@router.get("/seeds")
+async def ppr_seeds(limit: int = 200) -> list[dict]:
+    """Return the current seed weights with metadata (title, author, reason breakdown)."""
+    def _query():
+        from backend.services.ppr_engine import get_seed_weights, WATCH_BASE, PLAYLIST_BASE, FEED_REC_BASE
+        from backend.db import get_db
+
+        cfg = _get_ppr_config()
+        min_seed_rating = int(cfg.get("min_seed_rating", 0))
+        seeds = get_seed_weights(min_seed_rating=min_seed_rating)
+
+        if not seeds:
+            return []
+
+        conn = get_db()
+        ph = ",".join("?" * len(seeds))
+        vids = list(seeds.keys())
+
+        meta = {
+            r["video_id"]: dict(r)
+            for r in conn.execute(
+                f"""
+                SELECT video_id,
+                       COALESCE(fr.title, wh.title, pv.title) as title,
+                       COALESCE(fr.author, wh.author, pv.author) as author
+                FROM (SELECT video_id FROM watch_history WHERE video_id IN ({ph})
+                      UNION
+                      SELECT video_id FROM playlist_videos WHERE video_id IN ({ph})
+                      UNION
+                      SELECT video_id FROM feed_recommendations WHERE video_id IN ({ph})) v
+                LEFT JOIN feed_recommendations fr USING (video_id)
+                LEFT JOIN watch_history wh USING (video_id)
+                LEFT JOIN playlist_videos pv USING (video_id)
+                GROUP BY video_id
+                """,
+                vids + vids + vids,
+            ).fetchall()
+        }
+
+        watched = {r["video_id"] for r in conn.execute(f"SELECT video_id FROM watch_history WHERE video_id IN ({ph})", vids).fetchall()}
+        in_playlist = {r["video_id"] for r in conn.execute(f"SELECT DISTINCT video_id FROM playlist_videos WHERE video_id IN ({ph})", vids).fetchall()}
+        conn.close()
+
+        result = []
+        for vid, weight in sorted(seeds.items(), key=lambda x: -x[1]):
+            reasons = []
+            if vid in watched:
+                reasons.append(f"watched (+{WATCH_BASE})")
+            if vid in in_playlist:
+                reasons.append(f"playlist (+{PLAYLIST_BASE})")
+            m = meta.get(vid, {})
+            result.append({
+                "video_id": vid,
+                "weight": round(weight, 4),
+                "title": m.get("title"),
+                "author": m.get("author"),
+                "reasons": reasons,
+            })
+
+        return result[:max(1, min(limit, 1000))]
+
+    return await run_in_threadpool(_query)
+
+
+# ---------------------------------------------------------------------------
+# Graph stats
+# ---------------------------------------------------------------------------
+
+@router.get("/graph/stats")
+async def ppr_graph_stats() -> dict:
+    """Return basic graph statistics: node count, edge count, density."""
+    def _query():
+        from backend.db import get_db
+        conn = get_db()
+        edges = conn.execute("SELECT COUNT(*) as c FROM recommendation_edges").fetchone()["c"]
+        nodes_row = conn.execute(
+            "SELECT COUNT(DISTINCT source_video_id) + COUNT(DISTINCT target_video_id) as c FROM recommendation_edges"
+        ).fetchone()
+        unique_nodes = conn.execute(
+            """
+            SELECT COUNT(*) as c FROM (
+                SELECT source_video_id as v FROM recommendation_edges
+                UNION
+                SELECT target_video_id FROM recommendation_edges
+            )
+            """
+        ).fetchone()["c"]
+        seeds = conn.execute("SELECT COUNT(DISTINCT video_id) as c FROM ppr_scores").fetchone()["c"]
+        conn.close()
+        density = round(edges / (unique_nodes * (unique_nodes - 1)), 6) if unique_nodes > 1 else 0.0
+        return {"nodes": unique_nodes, "edges": edges, "density": density, "scored_nodes": seeds}
+
+    return await run_in_threadpool(_query)
+
+
+# ---------------------------------------------------------------------------
+# Feed filters
+# ---------------------------------------------------------------------------
+
+class FeedFilterRequest(BaseModel):
+    filter_type: str
+    match_value: str
+
+_VALID_FILTER_TYPES = {"channel_id", "channel_name", "keyword", "video_id"}
+
+
+@router.get("/feed-filters")
+async def list_feed_filters() -> list:
+    from backend.db import get_feed_filters
+    return await run_in_threadpool(get_feed_filters)
+
+
+@router.post("/feed-filters")
+async def add_feed_filter_ep(body: FeedFilterRequest) -> dict:
+    from backend.db import add_feed_filter
+    if body.filter_type not in _VALID_FILTER_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid filter_type; allowed: {sorted(_VALID_FILTER_TYPES)}")
+    if not body.match_value.strip():
+        raise HTTPException(status_code=400, detail="match_value required")
+    await run_in_threadpool(add_feed_filter, body.filter_type, body.match_value.strip())
+    from backend.services import feed_cache
+    feed_cache._snapshot.computed_at = 0.0
+    return {"ok": True}
+
+
+@router.delete("/feed-filters/{filter_id}")
+async def delete_feed_filter_ep(filter_id: int) -> dict:
+    from backend.db import delete_feed_filter
+    await run_in_threadpool(delete_feed_filter, filter_id)
     from backend.services import feed_cache
     feed_cache._snapshot.computed_at = 0.0
     return {"ok": True}

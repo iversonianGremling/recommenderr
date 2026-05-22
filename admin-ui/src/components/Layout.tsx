@@ -1,4 +1,4 @@
-import { NavLink, Outlet, useLocation } from 'react-router-dom'
+import { NavLink, Outlet } from 'react-router-dom'
 
 const NAV = [
   {
@@ -12,10 +12,10 @@ const NAV = [
   {
     label: 'Recommendation',
     items: [
-      { to: '/recommendation/config', label: 'Config', disabled: true },
-      { to: '/recommendation/scores', label: 'Scores', disabled: true },
-      { to: '/recommendation/weight-rules', label: 'Weight Rules', disabled: true },
-      { to: '/recommendation/filters', label: 'Filters', disabled: true },
+      { to: '/recommendation/config', label: 'Config' },
+      { to: '/recommendation/scores', label: 'Scores' },
+      { to: '/recommendation/weight-rules', label: 'Weight Rules' },
+      { to: '/recommendation/filters', label: 'Filters' },
     ],
   },
   {
@@ -64,7 +64,7 @@ export default function Layout() {
           ))}
         </nav>
         <div className="px-2.5 text-[10px] text-text-2 opacity-40">
-          Phase C — Discovery
+          Phase D — Recommendation
         </div>
       </aside>
 
