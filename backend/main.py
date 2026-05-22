@@ -95,7 +95,6 @@ app.include_router(video.router,     prefix="/v1/video",     tags=["video"])
 app.include_router(music.router,     prefix="/v1/music",     tags=["music"])
 app.include_router(comments.router,  prefix="/v1/comments",  tags=["comments"])
 app.include_router(radio.router,     prefix="/v1/radio",     tags=["radio"])
-app.include_router(admin.router,     prefix="/admin",        tags=["admin"])
 app.include_router(artists.router,   prefix="/v1/artists",   tags=["artists"])
 app.include_router(ppr.router,       prefix="/v1/ppr",       tags=["ppr"])
 app.include_router(crawl.router,     prefix="/v1/crawl",     tags=["crawl"])
@@ -103,10 +102,12 @@ app.include_router(items.router,     prefix="/v1/items",     tags=["items"])
 app.include_router(sources.router,   prefix="/v1/sources",   tags=["sources"])
 app.include_router(personas.router,  prefix="/v1/personas",  tags=["personas"])
 
-# Serve admin UI static assets if the SPA has been built.
-# Must be mounted BEFORE the admin router so /admin/assets/* doesn't hit the SPA catch-all.
+# StaticFiles must be mounted BEFORE the admin router — the admin catch-all
+# /{path:path} would otherwise intercept every /admin/assets/* request first.
 if ADMIN_ASSETS_DIR.exists():
     app.mount("/admin/assets", StaticFiles(directory=ADMIN_ASSETS_DIR), name="admin-assets")
+
+app.include_router(admin.router,     prefix="/admin",        tags=["admin"])
 
 # Legacy /api/ paths — mirror the monolith surface so nginx can drop the monolith fallback.
 # invidious.router at /api covers: /api/search, /api/trending, /api/channel/...,
