@@ -223,6 +223,7 @@ async def ppr_scores(limit: int = 50) -> list:
             LEFT JOIN feed_recommendations fr ON fr.video_id = ps.video_id
             LEFT JOIN watch_history wh ON wh.video_id = ps.video_id
             LEFT JOIN playlist_videos pv ON pv.video_id = ps.video_id
+            GROUP BY ps.video_id
             ORDER BY ps.score DESC
             LIMIT ?
             """,
