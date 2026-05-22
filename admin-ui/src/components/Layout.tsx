@@ -19,10 +19,16 @@ const NAV = [
     ],
   },
   {
+    label: 'Personas',
+    items: [
+      { to: '/personas', label: 'All Personas' },
+    ],
+  },
+  {
     label: 'Application',
     items: [
-      { to: '/app/feed', label: 'Feed', disabled: true },
-      { to: '/app/radio', label: 'Radio', disabled: true },
+      { to: '/app/feed', label: 'Feed' },
+      { to: '/app/radio', label: 'Radio' },
     ],
   },
 ]
@@ -40,31 +46,23 @@ export default function Layout() {
           {NAV.map((section) => (
             <div key={section.label}>
               <div className="nav-section-label">{section.label}</div>
-              {section.items.map((item) =>
-                'disabled' in item && item.disabled ? (
-                  <div
-                    key={item.to}
-                    className="nav-item opacity-35 cursor-not-allowed"
-                  >
-                    {item.label}
-                  </div>
-                ) : (
-                  <NavLink
-                    key={item.to}
-                    to={item.to}
-                    className={({ isActive }) =>
-                      `nav-item ${isActive ? 'nav-item-active' : ''}`
-                    }
-                  >
-                    {item.label}
-                  </NavLink>
-                )
-              )}
+              {section.items.map((item) => (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  end={item.to === '/personas'}
+                  className={({ isActive }) =>
+                    `nav-item ${isActive ? 'nav-item-active' : ''}`
+                  }
+                >
+                  {item.label}
+                </NavLink>
+              ))}
             </div>
           ))}
         </nav>
         <div className="px-2.5 text-[10px] text-text-2 opacity-40">
-          Phase D — Recommendation
+          Phase F — complete
         </div>
       </aside>
 

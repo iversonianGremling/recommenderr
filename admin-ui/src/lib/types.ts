@@ -87,6 +87,54 @@ export interface FeedFilter {
   created_at: number
 }
 
+export interface Persona {
+  id: number
+  name: string
+  description: string | null
+  scheme: string
+  alpha: number
+  min_seed_rating: number
+  created_at: number
+  updated_at: number
+  version: number
+  seed_count: number
+  job_status: 'pending' | 'running' | 'done' | 'error' | null
+  last_run_at: number | null
+  last_error: string | null
+  job_next_run?: number | null
+}
+
+export interface PersonaSeed {
+  item_id: number
+  scheme: string
+  external_id: string
+  weight: number
+  title: string | null
+  author: string | null
+}
+
+export interface PersonaScore {
+  video_id: string
+  score: number
+  spam_mass: number | null
+  computed_at: number
+  title: string | null
+  author: string | null
+  thumbnail: string | null
+  duration: number | null
+}
+
+export interface FeedItem {
+  video_id: string
+  title: string | null
+  author: string | null
+  author_id: string | null
+  thumbnail: string | null
+  duration: number | null
+  score: number | null
+  category: string | null
+}
+
 export interface WhyResult {
   video_id: string
   title?: string

@@ -1,4 +1,4 @@
-import type { FeedFilter, GraphStats, Item, PprConfig, PprScore, PprSeed, Scheme, Source, WeightRule, WhyResult } from './types'
+import type { FeedFilter, FeedItem, GraphStats, Item, Persona, PersonaSeed, PersonaScore, PprConfig, PprScore, PprSeed, Scheme, Source, WeightRule, WhyResult } from './types'
 
 const BASE = ''  // same origin; empty → relative URLs work with Vite proxy and in production
 
@@ -93,6 +93,49 @@ export const addFeedFilter = (body: { filter_type: string; match_value: string }
 
 export const deleteFeedFilter = (id: number) =>
   req<{ ok: boolean }>(`/v1/ppr/feed-filters/${id}`, { method: 'DELETE' })
+
+// ── Personas ──────────────────────────────────────────────────────────────────
+
+export const listPersonas = () => req<Persona[]>('/v1/personas')
+
+export const createPersona = (body: { name: string; description?: string; alpha?: number; min_seed_rating?: number }) =>
+  req<Persona>('/v1/personas', { method: 'POST', body: JSON.stringify(body) })
+
+export const getPersona = (id: number) => req<Persona>(`/v1/personas/${id}`)
+
+export const patchPersona = (id: number, body: Partial<Pick<Persona, 'name' | 'description' | 'alpha' | 'min_seed_rating'>>) =>
+  req<Persona>(`/v1/personas/${id}`, { method: 'PATCH', body: JSON.stringify(body) })
+
+export const deletePersona = (id: number) =>
+  fetch(`/v1/personas/${id}`, { method: 'DELETE' })
+
+export const getPersonaSeeds = (id: number) => req<PersonaSeed[]>(`/v1/personas/${id}/seeds`)
+
+export const setPersonaSeeds = (id: number, seeds: Array<{ scheme: string; external_id: string; weight?: number }>, merge = false) =>
+  req<{ ok: boolean; seed_count: number }>(`/v1/personas/${id}/seeds`, {
+    method: 'POST',
+    body: JSON.stringify({ seeds, merge }),
+  })
+
+export const deletePersonaSeed = (personaId: number, itemId: number) =>
+  fetch(`/v1/personas/${personaId}/seeds/${itemId}`, { method: 'DELETE' })
+
+export const getPersonaScores = (id: number, limit = 100) =>
+  req<PersonaScore[]>(`/v1/personas/${id}/scores?limit=${limit}`)
+
+export const recomputePersona = (id: number) =>
+  req<{ ok: boolean; scored: number; elapsed_seconds: number }>(`/v1/personas/${id}/recompute`, { method: 'POST' })
+
+// ── Feed ──────────────────────────────────────────────────────────────────────
+
+export const getPprFeed = (params: { limit?: number; offset?: number; category?: string; sort?: string }) => {
+  return req<{ items: FeedItem[]; total: number }>('/v1/ppr/feed', {
+    method: 'POST',
+    body: JSON.stringify({ limit: params.limit ?? 50, offset: params.offset ?? 0, category: params.category ?? '', sort: params.sort ?? 'score' }),
+  })
+}
+
+export const getPprFeedStatus = () => req<{ items: number; age_seconds: number | null; is_refreshing: boolean }>('/v1/ppr/feed/status')
 
 // ── Raw search proxy ─────────────────────────────────────────────────────────
 

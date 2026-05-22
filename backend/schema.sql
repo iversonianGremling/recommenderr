@@ -512,3 +512,43 @@ CREATE TABLE IF NOT EXISTS sources (
     circuit_open_until  REAL,
     metadata_json       TEXT                           -- env_var declarations, etc.
 );
+
+-- ----- Personas (synthetic seed bundles for topic-sensitive PPR) -----
+
+CREATE TABLE IF NOT EXISTS personas (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    scheme      TEXT NOT NULL DEFAULT 'yt_video',
+    alpha       REAL NOT NULL DEFAULT 0.15,
+    min_seed_rating INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS persona_seeds (
+    persona_id  INTEGER NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+    item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    weight      REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (persona_id, item_id)
+);
+
+CREATE TABLE IF NOT EXISTS persona_scores (
+    persona_id  INTEGER NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+    video_id    TEXT NOT NULL,
+    score       REAL NOT NULL,
+    spam_mass   REAL,
+    computed_at REAL NOT NULL,
+    PRIMARY KEY (persona_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ps_persona_score ON persona_scores(persona_id, score DESC);
+
+CREATE TABLE IF NOT EXISTS persona_jobs (
+    persona_id      INTEGER PRIMARY KEY REFERENCES personas(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    last_run_at     REAL,
+    next_run_at     REAL,
+    last_error      TEXT,
+    claimed_version INTEGER
+);

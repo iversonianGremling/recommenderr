@@ -57,6 +57,7 @@ async def lifespan(app: FastAPI):
         from backend.services.artist_release_worker import artist_release_worker
         from backend.services.category_recs import category_recs_worker
 
+        from backend.services.persona_worker import persona_worker
         tasks = [
             asyncio.create_task(crawl_worker()),
             asyncio.create_task(music_worker()),
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(category_recs_worker(1)),
             asyncio.create_task(category_recs_worker(2)),
             asyncio.create_task(category_recs_worker(3)),
+            asyncio.create_task(persona_worker()),
         ]
     # Warm the feed cache in the background so first requests are instant.
     from backend.services import feed_cache as _feed_cache
@@ -85,7 +87,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from backend.routers import invidious, video, music, comments, radio, admin, artists, auth, ppr, crawl, items, sources  # noqa: E402
+from backend.routers import invidious, video, music, comments, radio, admin, artists, auth, ppr, crawl, items, sources, personas  # noqa: E402
 
 # Versioned API paths (internal / new clients)
 app.include_router(invidious.router, prefix="/v1/invidious", tags=["invidious"])
@@ -99,6 +101,7 @@ app.include_router(ppr.router,       prefix="/v1/ppr",       tags=["ppr"])
 app.include_router(crawl.router,     prefix="/v1/crawl",     tags=["crawl"])
 app.include_router(items.router,     prefix="/v1/items",     tags=["items"])
 app.include_router(sources.router,   prefix="/v1/sources",   tags=["sources"])
+app.include_router(personas.router,  prefix="/v1/personas",  tags=["personas"])
 
 # Serve admin UI static assets if the SPA has been built.
 # Must be mounted BEFORE the admin router so /admin/assets/* doesn't hit the SPA catch-all.
