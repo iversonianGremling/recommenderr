@@ -1,33 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getPprFeed, getPprFeedStatus, invalidatePpr } from '../lib/api'
 import type { FeedItem } from '../lib/types'
-
-function Duration({ secs }: { secs: number | null }) {
-  if (secs == null) return null
-  const m = Math.floor(secs / 60)
-  const s = secs % 60
-  return <>{m}:{String(s).padStart(2, '0')}</>
-}
-
-function VideoCard({ item }: { item: FeedItem }) {
-  return (
-    <div className="rounded border border-border bg-bg-2 overflow-hidden flex flex-col">
-      {item.thumbnail ? (
-        <img src={item.thumbnail} alt="" className="w-full aspect-video object-cover" />
-      ) : (
-        <div className="w-full aspect-video bg-bg-3 flex items-center justify-center text-text-2 text-xs">No image</div>
-      )}
-      <div className="p-2 flex-1 flex flex-col gap-0.5">
-        <p className="text-xs font-medium text-text line-clamp-2 leading-snug">{item.title ?? item.video_id}</p>
-        {item.author && <p className="text-[10px] text-text-2 truncate">{item.author}</p>}
-        <div className="mt-auto flex items-center justify-between text-[10px] text-text-2 pt-1">
-          {item.score != null && <span className="font-mono">{item.score.toFixed(5)}</span>}
-          <Duration secs={item.duration} />
-        </div>
-      </div>
-    </div>
-  )
-}
+import { ItemTable, normalizeItem } from '../components/ItemTable'
 
 export default function AppFeed() {
   const [items, setItems] = useState<FeedItem[]>([])
@@ -43,7 +17,7 @@ export default function AppFeed() {
     setError(null)
     try {
       const [feed, st] = await Promise.all([
-        getPprFeed({ limit: 48, offset: 0, category, sort }),
+        getPprFeed({ limit: 100, offset: 0, category, sort }),
         getPprFeedStatus(),
       ])
       setItems(feed.items)
@@ -67,6 +41,30 @@ export default function AppFeed() {
     }
   }
 
+  const normalized = items.map((i) => normalizeItem(i as unknown as Record<string, unknown>))
+
+  const feedToolbar = (
+    <div className="flex items-center gap-2 flex-wrap">
+      <input
+        className="input text-xs py-1 w-32"
+        placeholder="Category…"
+        value={category}
+        onChange={(e) => setCategory(e.target.value)}
+      />
+      <select className="input text-xs py-1" value={sort} onChange={(e) => setSort(e.target.value)}>
+        <option value="score">By score</option>
+        <option value="date">By date</option>
+        <option value="title">By title</option>
+        <option value="channel">By channel</option>
+        <option value="duration">By duration</option>
+        <option value="spam_mass">By spam mass</option>
+      </select>
+      <button className="btn text-xs py-1 px-3" onClick={handleRefresh} disabled={refreshing}>
+        {refreshing ? 'Refreshing…' : 'Invalidate cache'}
+      </button>
+    </div>
+  )
+
   return (
     <div>
       <div className="flex items-center gap-3 mb-4 flex-wrap">
@@ -78,36 +76,20 @@ export default function AppFeed() {
             {status.is_refreshing && ' · refreshing…'}
           </span>
         )}
-        <div className="ml-auto flex items-center gap-2">
-          <input
-            className="input text-xs py-1 w-32"
-            placeholder="Category…"
-            value={category}
-            onChange={(e) => setCategory(e.target.value)}
-          />
-          <select className="input text-xs py-1" value={sort} onChange={(e) => setSort(e.target.value)}>
-            <option value="score">By score</option>
-            <option value="date">By date</option>
-            <option value="random">Random</option>
-          </select>
-          <button className="btn text-xs py-1 px-3" onClick={handleRefresh} disabled={refreshing}>
-            {refreshing ? 'Refreshing…' : 'Invalidate cache'}
-          </button>
-        </div>
       </div>
 
       {error && <p className="text-red-500 text-sm mb-3">{error}</p>}
       {loading && <p className="text-text-2 text-sm">Loading…</p>}
 
       {!loading && (
-        <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))' }}>
-          {items.map((item) => (
-            <VideoCard key={item.video_id} item={item} />
-          ))}
-          {items.length === 0 && (
-            <p className="text-text-2 text-sm col-span-full">No feed items — run Recompute in the Recommendation panel first.</p>
-          )}
-        </div>
+        <ItemTable
+          items={normalized}
+          defaultColumns={['thumbnail', 'title', 'score', 'duration', 'category', 'published_at']}
+          storageKey="app-feed"
+          withGrid
+          toolbar={feedToolbar}
+          emptyMessage="No feed items — run Recompute in the Recommendation panel first."
+        />
       )}
     </div>
   )
