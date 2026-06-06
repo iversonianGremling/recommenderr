@@ -1,18 +1,19 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
   color-scheme: dark;
-  --color-bg: 6 10 18;
-  --color-bg-2: 11 16 28;
-  --color-bg-3: 19 26 40;
-  --color-border: 47 62 88;
-  --color-text: 239 244 255;
-  --color-text-2: 145 160 188;
-  --color-accent: 255 92 98;
-  --color-accent-hover: 255 122 126;
-  --color-accent-2: 96 232 205;
+  --color-bg: 11 11 13;          /* #0b0b0d  app background */
+  --color-bg-2: 17 17 19;        /* #111113  panels / cards */
+  --color-bg-3: 26 26 30;        /* #1a1a1e  hover / elevated */
+  --color-border: 42 42 47;      /* hairline — reads like #ffffff14 over the bg */
+  --color-text: 237 237 239;     /* #ededef */
+  --color-text-2: 138 138 146;   /* #8a8a92  muted */
+  --color-accent: 110 139 255;       /* #6e8bff  single accent */
+  --color-accent-hover: 138 160 255; /* #8aa0ff */
+  --color-accent-2: 52 211 153;      /* #34d399  positive / recompute only */
 }
 
 html { background: rgb(var(--color-bg)); }
@@ -22,34 +23,36 @@ body {
   margin: 0;
   color: rgb(var(--color-text));
   background: rgb(var(--color-bg));
-  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   font-size: 14px;
   line-height: 1.5;
+  letter-spacing: -0.006em;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 #root { min-height: 100vh; }
 
 * {
-  scrollbar-color: rgba(96, 232, 205, 0.35) rgba(255, 255, 255, 0.04);
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
   scrollbar-width: thin;
 }
 
 @layer base {
-  a { @apply text-text no-underline transition-colors duration-200 hover:text-accent; }
+  a { @apply text-text no-underline transition-colors duration-150 hover:text-accent; }
 
   button {
-    @apply inline-flex items-center justify-center gap-2 rounded-sm border border-border
-      bg-bg-3 px-3 py-1.5 text-[13px] font-medium text-text transition-colors duration-200
-      hover:border-accent hover:text-white focus-visible:outline-none focus-visible:ring-2
-      focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-45;
+    @apply inline-flex items-center justify-center gap-2 rounded-md border border-border
+      bg-bg-2 px-3 py-1.5 text-[13px] font-medium text-text transition-all duration-150
+      hover:border-text-2/40 hover:bg-bg-3 focus-visible:outline-none focus-visible:ring-2
+      focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-45;
   }
 
   input, select, textarea {
-    @apply rounded border border-border bg-bg-2 px-3 py-1.5 text-sm text-text outline-none
-      transition-colors duration-200 placeholder:text-text-2 focus:border-accent focus:ring-1
-      focus:ring-accent;
+    @apply rounded-md border border-border bg-bg-2 px-3 py-1.5 text-[13px] text-text outline-none
+      transition-colors duration-150 placeholder:text-text-2/70 focus:border-accent focus:ring-1
+      focus:ring-accent/40;
   }
 }
 
@@ -60,18 +63,19 @@ body {
 
   .btn-primary {
     @apply border-transparent bg-accent text-white hover:bg-accent-hover hover:border-transparent;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
   }
 
   .btn-accent {
-    @apply border-accent2 text-accent2 hover:bg-accent2 hover:text-bg;
+    @apply border-accent2/50 text-accent2 hover:bg-accent2 hover:text-bg hover:border-transparent;
   }
 
   .btn-ghost {
-    @apply border border-border bg-bg-3 text-text-2 hover:border-accent hover:text-text;
+    @apply border-transparent bg-transparent text-text-2 hover:bg-bg-3 hover:text-text;
   }
 
   .page-title {
-    @apply text-base font-semibold text-text;
+    @apply text-lg font-semibold tracking-tight text-text;
   }
 
   .label {
@@ -79,38 +83,39 @@ body {
   }
 
   .input {
-    /* inherits base input styles */
     @apply block;
   }
 
   .th {
-    @apply px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-text-2 border-b border-border;
+    @apply px-3 py-2 text-left text-[11px] font-medium uppercase tracking-wider text-text-2 border-b border-border;
   }
 
   .td {
-    @apply px-3 py-2 text-xs text-text border-b border-border;
+    @apply px-3 py-2.5 text-[13px] text-text border-b border-border;
   }
 
   .tr {
-    @apply hover:bg-bg-3 transition-colors;
+    @apply transition-colors hover:bg-bg-2;
   }
 
   .surface {
-    @apply overflow-hidden rounded-[14px] border border-border;
+    @apply overflow-hidden rounded-lg border border-border;
     background: rgb(var(--color-bg-2));
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px -16px rgba(0, 0, 0, 0.55);
   }
 
   .nav-item {
-    @apply flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[12px] font-medium
+    @apply flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] font-medium
       text-text-2 transition-colors hover:bg-bg-3 hover:text-text cursor-pointer;
   }
 
   .nav-item-active {
-    @apply bg-bg-3 text-accent;
+    @apply bg-bg-3 text-text;
+    box-shadow: inset 2px 0 0 rgb(var(--color-accent));
   }
 
   .nav-section-label {
-    @apply px-2.5 py-1 text-[10px] font-semibold uppercase tracking-widest text-text-2 opacity-50;
+    @apply px-2.5 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-widest text-text-2/60;
   }
 
   .tag {

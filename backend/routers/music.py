@@ -80,6 +80,75 @@ from backend.services.music_tags import (
 
 router = APIRouter()
 
+
+@router.get("/feed-version")
+async def music_feed_version() -> dict:
+    """Combined feed generation across the music graphs (content_type='music').
+    The ytmusic app polls this; a change means recommenderr recomputed music
+    recs and the recommended view should re-fetch. Always instant."""
+    from fastapi.concurrency import run_in_threadpool
+    from backend.db import get_db
+    from backend.services import feed_cache
+
+    def _music_graph_ids():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id FROM graphs WHERE content_type = 'music'"
+        ).fetchall()
+        conn.close()
+        return [r["id"] for r in rows]
+
+    ids = await run_in_threadpool(_music_graph_ids)
+    # Sum is monotonic across independent per-graph counters, so any bump on any
+    # music graph changes the value the client compares against.
+    generation = sum(feed_cache.get_generation(gid) for gid in ids)
+    return {"generation": generation, "graph_ids": ids}
+
+
+# Keyword feed-filters for music recs are stored under the Songs graph and read
+# back by the recommended `music_library` query (see its NOT EXISTS clause).
+MUSIC_FILTER_GRAPH_ID = 2
+
+
+@router.get("/video-keywords/{video_id}")
+async def music_video_keywords(video_id: str) -> dict:
+    """A track's YouTube tags for the ytmusic dislike panel's suppress chips."""
+    from fastapi.concurrency import run_in_threadpool
+    from backend.db import get_db
+
+    def _q():
+        conn = get_db()
+        kws = [r["keyword"] for r in conn.execute(
+            "SELECT keyword FROM video_keywords WHERE video_id=? ORDER BY LENGTH(keyword), keyword",
+            (video_id,),
+        )]
+        active = [r["match_value"].lower() for r in conn.execute(
+            "SELECT match_value FROM feed_filters WHERE graph_id=? AND filter_type='keyword'",
+            (MUSIC_FILTER_GRAPH_ID,),
+        )]
+        conn.close()
+        filtered = sorted({k for k in kws if any(a in k.lower() for a in active)})
+        return {"video_id": video_id, "keywords": kws, "filtered": filtered}
+
+    return await run_in_threadpool(_q)
+
+
+class MusicSuppressKeyword(BaseModel):
+    keyword: str
+
+
+@router.post("/suppress-keyword")
+async def music_suppress_keyword(body: MusicSuppressKeyword) -> dict:
+    """Stop recommending music tracks tagged/titled with this keyword."""
+    from fastapi.concurrency import run_in_threadpool
+    from backend.db import add_feed_filter
+    kw = body.keyword.strip().lower()
+    if not kw:
+        raise HTTPException(status_code=400, detail="keyword required")
+    await run_in_threadpool(add_feed_filter, "keyword", kw, MUSIC_FILTER_GRAPH_ID)
+    return {"ok": True, "keyword": kw}
+
+
 INVIDIOUS_URL = os.getenv("INVIDIOUS_URL", "http://192.168.1.173:3000")
 ALBUM_HINT_RE = re.compile(
     r"\b(full album|album|ep|lp|ost|soundtrack|official audios?|official videos?)\b",
@@ -2675,11 +2744,8 @@ async def music_followed_artists(
 
 @router.post("/follows/artists/check")
 async def check_followed_artists():
-    results = await check_followed_artists_once()
-    return {
-        "ok": True,
-        "checked": len(results),
-    }
+    asyncio.create_task(check_followed_artists_once())
+    return {"ok": True, "checked": 0}
 
 
 @router.post("/follows/artists/sync-from-ratings")
@@ -3531,6 +3597,17 @@ async def music_library(
         # Don't re-suggest tracks the user has already rated.
         filters.append(
             "NOT EXISTS (SELECT 1 FROM video_ratings vr_existing WHERE vr_existing.video_id = ml.video_id)"
+        )
+        # Honour keyword suppression from the ytmusic dislike panel: drop tracks
+        # whose title/track/artist OR YouTube tags match an active keyword filter.
+        filters.append(
+            "NOT EXISTS (SELECT 1 FROM feed_filters ff WHERE ff.filter_type='keyword' "
+            f"AND ff.graph_id={MUSIC_FILTER_GRAPH_ID} AND ("
+            "LOWER(COALESCE(ml.title,'')) LIKE '%'||ff.match_value||'%' "
+            "OR LOWER(COALESCE(ml.track,'')) LIKE '%'||ff.match_value||'%' "
+            "OR LOWER(COALESCE(ml.artist,'')) LIKE '%'||ff.match_value||'%' "
+            "OR EXISTS (SELECT 1 FROM video_keywords vk WHERE vk.video_id=ml.video_id "
+            "AND LOWER(vk.keyword) LIKE '%'||ff.match_value||'%')))"
         )
 
     q_clean = (q or "").strip()

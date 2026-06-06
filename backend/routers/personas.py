@@ -314,3 +314,115 @@ async def recompute_persona(persona_id: int) -> dict:
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Auto-generate personas from video_keywords
+# ---------------------------------------------------------------------------
+
+class AutoGenerateRequest(BaseModel):
+    top_keywords: int = 15
+    min_videos_per_keyword: int = 3
+    max_seeds_per_persona: int = 30
+    min_watch_or_rating: bool = True  # only use watched/rated videos as seeds
+
+
+@router.post("/auto-generate")
+async def auto_generate_personas(req: AutoGenerateRequest) -> dict:
+    """Generate one persona per top keyword, seeded by watched/rated videos with that keyword.
+
+    Skips any keyword that already has a persona with the same name.
+    Returns counts of created and skipped personas.
+    """
+    def _run():
+        conn = _get_db()
+        now = time.time()
+
+        # Find top keywords by video count among watched/rated videos
+        if req.min_watch_or_rating:
+            kw_rows = conn.execute("""
+                SELECT vk.keyword, COUNT(DISTINCT vk.video_id) as c
+                FROM video_keywords vk
+                WHERE EXISTS (
+                    SELECT 1 FROM watch_history wh WHERE wh.video_id = vk.video_id
+                ) OR EXISTS (
+                    SELECT 1 FROM video_ratings vr WHERE vr.video_id = vk.video_id AND vr.rating > 5
+                )
+                GROUP BY vk.keyword
+                HAVING c >= ?
+                ORDER BY c DESC
+                LIMIT ?
+            """, (req.min_videos_per_keyword, req.top_keywords)).fetchall()
+        else:
+            kw_rows = conn.execute("""
+                SELECT keyword, COUNT(DISTINCT video_id) as c
+                FROM video_keywords
+                GROUP BY keyword
+                HAVING c >= ?
+                ORDER BY c DESC
+                LIMIT ?
+            """, (req.min_videos_per_keyword, req.top_keywords)).fetchall()
+
+        existing_names = {
+            r["name"] for r in conn.execute("SELECT name FROM personas").fetchall()
+        }
+
+        created, skipped = [], []
+        for kw_row in kw_rows:
+            kw = kw_row["keyword"]
+            persona_name = f"kw:{kw}"
+            if persona_name in existing_names:
+                skipped.append(kw)
+                continue
+
+            # Find best seed videos: prefer highly-rated, then watched
+            seed_rows = conn.execute("""
+                SELECT vk.video_id,
+                       COALESCE(vr.rating, 5) as rating,
+                       CASE WHEN wh.video_id IS NOT NULL THEN 1 ELSE 0 END as watched
+                FROM video_keywords vk
+                LEFT JOIN video_ratings vr ON vr.video_id = vk.video_id
+                LEFT JOIN watch_history wh ON wh.video_id = vk.video_id
+                WHERE vk.keyword = ?
+                  AND (wh.video_id IS NOT NULL OR vr.rating > 5)
+                ORDER BY COALESCE(vr.rating, 0) DESC, watched DESC
+                LIMIT ?
+            """, (kw, req.max_seeds_per_persona)).fetchall()
+
+            if len(seed_rows) < req.min_videos_per_keyword:
+                skipped.append(kw)
+                continue
+
+            # Create persona
+            cur = conn.execute(
+                "INSERT INTO personas (name, description, scheme, alpha, min_seed_rating, created_at, updated_at, version) "
+                "VALUES (?, ?, 'yt_video', 0.15, 0, ?, ?, 1)",
+                (persona_name, f"Auto-generated from keyword: {kw}", now, now),
+            )
+            pid = cur.lastrowid
+            conn.execute(
+                "INSERT OR IGNORE INTO persona_jobs (persona_id, status, next_run_at) VALUES (?, 'pending', ?)",
+                (pid, now),
+            )
+
+            # Resolve video_ids → item IDs and insert seeds
+            for sr in seed_rows:
+                item_row = conn.execute(
+                    "SELECT id FROM items WHERE scheme='yt_video' AND external_id=?",
+                    (sr["video_id"],),
+                ).fetchone()
+                if not item_row:
+                    continue
+                weight = float(sr["rating"]) / 10.0 if sr["rating"] else 0.5
+                conn.execute(
+                    "INSERT OR IGNORE INTO persona_seeds (persona_id, item_id, weight) VALUES (?,?,?)",
+                    (pid, item_row["id"], weight),
+                )
+
+            conn.commit()
+            created.append(kw)
+
+        conn.close()
+        return {"created": created, "skipped": skipped, "total_created": len(created)}
+
+    return await run_in_threadpool(_run)

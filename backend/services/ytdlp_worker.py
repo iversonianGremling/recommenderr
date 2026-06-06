@@ -14,20 +14,37 @@ On startup it writes {"ready": true}\n so the parent knows imports finished.
 import sys
 import json
 import logging
+import os
 import yt_dlp
 
 # Silence yt-dlp's logger — the parent process does its own logging.
 logging.disable(logging.CRITICAL)
 
-_YDL_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "skip_download": True,
-}
+
+def _build_opts() -> dict:
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
+    }
+    cookie_file = os.getenv("YTDLP_COOKIES_FILE")
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+    browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
+    if browser and not cookie_file:
+        opts["cookiesfrombrowser"] = (browser,)
+    # Pin egress to the vpn-gateway's rotating Mullvad SOCKS proxy (microsocks).
+    # The address is stable across rotations; only the upstream exit changes.
+    proxy = os.getenv("YTDLP_PROXY") or "socks5://10.10.10.1:1080"
+    if proxy:
+        opts["proxy"] = proxy
+    return opts
 
 
 def _make_ydl() -> yt_dlp.YoutubeDL:
-    return yt_dlp.YoutubeDL(_YDL_OPTS)
+    return yt_dlp.YoutubeDL(_build_opts())
 
 
 def _to_json_safe(obj):

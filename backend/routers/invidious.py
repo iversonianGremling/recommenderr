@@ -4,8 +4,9 @@ import os
 import httpx
 import yt_dlp
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from backend.services.invidious_client import api_get
-from backend.services import ytdlp_service
+from backend.services.invidious_client import api_get, api_get_cached
+from backend.services import ytdlp_service, exit_manager
+from backend.db import get_invidious_cache, set_invidious_cache
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -45,7 +46,12 @@ def _topic_display_name(title: str | None) -> str:
     if not title:
         return ""
     prefix = "Uploads from "
-    return title[len(prefix):].strip() if title.startswith(prefix) else title.strip()
+    name = title[len(prefix):] if title.startswith(prefix) else title
+    name = name.strip()
+    # The /videos tab titles itself "<Channel> - Videos"; drop that suffix.
+    if name.endswith(" - Videos"):
+        name = name[:-len(" - Videos")].strip()
+    return name
 
 
 def _topic_entry_thumbs(entry: dict) -> list[dict]:
@@ -76,15 +82,46 @@ def _extract_topic_channel(channel_id: str, page: int) -> dict:
         "skip_download": True,
         "playliststart": start,
         "playlistend": end,
+        # Locked-down egress: a bare YoutubeDL hits www.youtube.com directly and
+        # gets Connection refused. Route through the same rotating Mullvad SOCKS
+        # proxy + cookies the (working) video service uses.
+        **ytdlp_service._proxy_opts(),
+        **ytdlp_service._cookie_opts(),
     }) as ydl:
-        return ydl.extract_info(f"https://www.youtube.com/channel/{channel_id}", download=False) or {}
+        return ydl.extract_info(f"https://www.youtube.com/channel/{channel_id}/videos", download=False) or {}
 
 
 async def _topic_channel_fallback(channel_id: str, page: int) -> dict:
     loop = asyncio.get_running_loop()
-    playlist = await loop.run_in_executor(None, _extract_topic_channel, channel_id, page)
+    # Egress through the shared Mullvad SOCKS exit is flaky under load — a single
+    # attempt can hit a transient "general SOCKS server failure". Retry a couple
+    # times (a fresh attempt usually succeeds) before giving up.
+    playlist: dict = {}
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            playlist = await loop.run_in_executor(None, _extract_topic_channel, channel_id, page)
+            if playlist.get("entries"):
+                break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("[channel] extract attempt %d/3 failed for %s: %s",
+                           attempt + 1, channel_id, str(exc)[:140])
+            if attempt < 2:
+                # Connection/SOCKS failure usually means the shared exit IP is
+                # being refused by YouTube — rotate to a fresh one before retry.
+                if ytdlp_service._is_conn_error(exc):
+                    exit_manager.note_conn_fail()
+                    if exit_manager.should_rotate_now():
+                        await exit_manager.rotate("ytdlp")
+                    else:
+                        await asyncio.sleep(1.0)
+                else:
+                    await asyncio.sleep(1.0)
     entries = playlist.get("entries") or []
     if not entries:
+        if last_exc is not None:
+            raise Exception(f"Channel extraction failed for {channel_id}: {last_exc}")
         raise Exception(f"No channel entries found for {channel_id}")
 
     raw_author = (
@@ -153,6 +190,18 @@ async def search(q: str = Query(...), page: int = Query(1)):
             playlists = []
         if isinstance(channels, Exception):
             channels = []
+
+        # yt-dlp fallback for video results when Invidious is down/empty.
+        # Page 1 only — yt-dlp flat search isn't paginated like Invidious.
+        if not videos and page == 1:
+            try:
+                from backend.services import ytdlp_service
+                videos = await ytdlp_service.search_youtube(q, limit=20)
+                if videos:
+                    logger.info("[search] Invidious empty for %r — served %d videos via yt-dlp", q, len(videos))
+            except Exception as e:
+                logger.warning("[search] yt-dlp search fallback failed for %r: %s", q, e)
+
         return {
             "videos": _fix_thumbs(videos),
             "playlists": _fix_thumbs(playlists),
@@ -176,8 +225,8 @@ async def channel(channel_id: str, page: int = Query(1)):
     vids = None
     try:
         info, vids = await asyncio.gather(
-            api_get(f"/channels/{channel_id}"),
-            api_get(f"/channels/{channel_id}/videos", {"page": page}),
+            api_get_cached(f"/channels/{channel_id}", ttl=24 * 3600),
+            api_get_cached(f"/channels/{channel_id}/videos", {"page": page}, ttl=6 * 3600),
             return_exceptions=True,
         )
         if not isinstance(info, Exception) and not isinstance(vids, Exception):
@@ -211,12 +260,24 @@ async def channel(channel_id: str, page: int = Query(1)):
 
 @router.get("/video/{video_id}/recommendations")
 async def recommendations(video_id: str):
+    # Per-video recommendations cache, checked FIRST so a warm (or negatively
+    # cached) entry skips the upstream Invidious call entirely — important when
+    # egress is down, since that call otherwise blocks ~10s on timeout every
+    # time before any fallback runs. `is not None` so a cached-empty list counts.
+    _recs_key = f"video_recs:{video_id}"
+    _cached_recs = get_invidious_cache(_recs_key)
+    if _cached_recs is not None:
+        return _cached_recs
     try:
-        data = await api_get(f"/videos/{video_id}")
-        return _fix_thumbs(data.get("recommendedVideos", []))
+        data = await api_get_cached(f"/videos/{video_id}", ttl=6 * 3600)
+        recs = _fix_thumbs(data.get("recommendedVideos", []))
+        # Real recs: cache 6h. Empty: short negative-cache TTL so repeated views
+        # don't re-run the slow path (and hammer egress) when nothing is available.
+        set_invidious_cache(_recs_key, recs, 6 * 3600 if recs else 600)
+        return recs
     except Exception:
         pass
-    # Invidious failed — fall back to yt-dlp related_videos
+    # No cache — fall back to yt-dlp related_videos
     try:
         info = ytdlp_service.get_raw_info(video_id)
         if not info:
@@ -242,9 +303,18 @@ async def recommendations(video_id: str):
                 "viewCountText": str(v.get("view_count") or ""),
                 **({"published": int(ts)} if ts else {}),
             })
+        set_invidious_cache(_recs_key, result, 6 * 3600 if result else 600)
         return result
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        # camoufox fallback: scrape YouTube directly
+        try:
+            from backend.services.invidious_client import camoufox_get
+            data = await camoufox_get(f"/videos/{video_id}")
+            recs = _fix_thumbs(data.get("recommendedVideos", []))
+            set_invidious_cache(_recs_key, recs, 6 * 3600 if recs else 600)
+            return recs
+        except Exception:
+            raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.get("/playlist/{playlist_id}")
@@ -279,7 +349,7 @@ async def subscriptions(request: Request):
 
 @router.get("/video/{video_id}/storyboards/sprite")
 async def storyboard_sprite(video_id: str):
-    from services import storyboard_service
+    from backend.services import storyboard_service
     from fastapi.responses import FileResponse
     sprite = storyboard_service._sprite_path(video_id)
     if not os.path.exists(sprite):
@@ -299,7 +369,7 @@ async def storyboards(video_id: str):
     except Exception:
         pass
     # Fall back to generated sprite-sheet storyboard
-    from services import storyboard_service
+    from backend.services import storyboard_service
     meta = await storyboard_service.get_or_wait(video_id)
     if meta:
         return [meta]

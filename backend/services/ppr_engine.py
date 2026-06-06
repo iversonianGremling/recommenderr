@@ -4,7 +4,8 @@ from backend.db import get_db
 
 # Weight for a video that was merely watched (no rating, not in a playlist).
 # Intentionally tiny — passive watch history should not compete with explicit signals.
-WATCH_BASE = 0.01
+# Lowered 0.01 -> 0.004 (2026-06-06) to further reduce passively-watched, unrated videos' pull.
+WATCH_BASE = 0.004
 
 # Weight added for explicit playlist membership (deliberate curation).
 PLAYLIST_BASE = 3.0
@@ -18,10 +19,49 @@ PLAYLIST_BASE = 3.0
 FEED_REC_BASE = 1.5
 
 
-def build_graph():
-    """Build adjacency list from recommendation_edges. Returns {src: [(tgt, weight), ...]}."""
+_MUSIC_EDGE_FILTER = """
+    re.source_video_id IN (
+        SELECT video_id FROM recognition_cache WHERE is_music = 1
+        UNION SELECT video_id FROM music_library
+    )
+"""
+
+_GRAPH_EDGE_QUERIES: dict[str, str] = {
+    "mixed": "SELECT source_video_id, target_video_id, weight FROM recommendation_edges",
+    "music": f"""
+        SELECT re.source_video_id, re.target_video_id, re.weight
+        FROM recommendation_edges re
+        WHERE {_MUSIC_EDGE_FILTER}
+    """,
+    "video": """
+        SELECT re.source_video_id, re.target_video_id, re.weight
+        FROM recommendation_edges re
+        WHERE re.source_video_id NOT IN (
+            SELECT video_id FROM recognition_cache WHERE is_music = 1
+        )
+    """,
+    # album/artist: same music edges; output is aggregated by album/artist at feed-serve time
+    "album": f"""
+        SELECT re.source_video_id, re.target_video_id, re.weight
+        FROM recommendation_edges re
+        WHERE {_MUSIC_EDGE_FILTER}
+    """,
+    "artist": f"""
+        SELECT re.source_video_id, re.target_video_id, re.weight
+        FROM recommendation_edges re
+        WHERE {_MUSIC_EDGE_FILTER}
+    """,
+}
+
+
+def build_graph(content_type: str = "mixed"):
+    """Build adjacency list from recommendation_edges, filtered by content_type.
+
+    content_type: 'mixed' (all), 'music' (music-confirmed only), 'video' (non-music only).
+    Returns {src: [(tgt, weight), ...]}."""
+    query = _GRAPH_EDGE_QUERIES.get(content_type, _GRAPH_EDGE_QUERIES["mixed"])
     conn = get_db()
-    rows = conn.execute("SELECT source_video_id, target_video_id, weight FROM recommendation_edges").fetchall()
+    rows = conn.execute(query).fetchall()
     conn.close()
 
     graph = defaultdict(list)
@@ -103,7 +143,14 @@ def _load_effective_ratings(candidate_ids: list, author_map: dict) -> dict[str, 
     return effective
 
 
-def get_seed_weights(min_seed_rating: int = 0):
+def get_seed_weights(
+    min_seed_rating: int = 0,
+    recency_halflife_days: float = 0.0,
+    graph_id: int = 1,
+    watch_base: float = WATCH_BASE,
+    playlist_base: float = PLAYLIST_BASE,
+    feed_rec_base: float = FEED_REC_BASE,
+):
     """Build personalization vector from history, playlists, video ratings, and channel ratings.
 
     Weight model (normal mode, min_seed_rating=0):
@@ -162,9 +209,9 @@ def get_seed_weights(min_seed_rating: int = 0):
         for vid in all_candidates:
             w = 0.0
             if vid in watched_set:
-                w += WATCH_BASE
+                w += watch_base
             if vid in playlist_set:
-                w += PLAYLIST_BASE
+                w += playlist_base
             r = effective_rating.get(vid)
             if r is not None:
                 rm = rating_mult(r)
@@ -212,7 +259,7 @@ def get_seed_weights(min_seed_rating: int = 0):
         rm = rating_mult(int(eff_r))
         if rm <= 0:
             continue
-        seeds[vid] = seeds.get(vid, 0.0) + FEED_REC_BASE * rm
+        seeds[vid] = seeds.get(vid, 0.0) + feed_rec_base * rm
 
     # Feed recommendation feedback
     conn = get_db()
@@ -275,9 +322,12 @@ def get_seed_weights(min_seed_rating: int = 0):
         else:
             conn.close()
 
-    # Weight rules: keyword / genre / category / attribute
+    # Weight rules: keyword / genre / category / attribute (graph-scoped)
     conn = get_db()
-    rules = conn.execute("SELECT rule_type, match_value, multiplier FROM weight_rules").fetchall()
+    rules = conn.execute(
+        "SELECT rule_type, match_value, multiplier FROM weight_rules WHERE graph_id=?",
+        (graph_id,)
+    ).fetchall()
     keyword_rules = {r["match_value"]: r["multiplier"] for r in rules if r["rule_type"] == "keyword"}
     genre_rules   = {r["match_value"]: r["multiplier"] for r in rules if r["rule_type"] == "genre"}
     category_rules = {r["match_value"]: r["multiplier"] for r in rules if r["rule_type"] == "category"}
@@ -353,8 +403,11 @@ def get_seed_weights(min_seed_rating: int = 0):
             if mult != 1.0:
                 seeds[vid] *= mult
 
-    # Apply feed filters
-    filters = conn.execute("SELECT filter_type, match_value FROM feed_filters").fetchall()
+    # Apply feed filters (graph-scoped)
+    filters = conn.execute(
+        "SELECT filter_type, match_value FROM feed_filters WHERE graph_id=?",
+        (graph_id,)
+    ).fetchall()
     if filters:
         keyword_filters = [f["match_value"] for f in filters if f["filter_type"] == "keyword"]
         channel_id_filters = {f["match_value"] for f in filters if f["filter_type"] == "channel_id"}
@@ -390,6 +443,23 @@ def get_seed_weights(min_seed_rating: int = 0):
                 seeds[vid] = 0.0
 
     conn.close()
+
+    if recency_halflife_days > 0:
+        import math as _math
+        halflife_secs = recency_halflife_days * 86400
+        decay_k = _math.log(2) / halflife_secs
+        now = time.time()
+        conn_ts = get_db()
+        ts_rows = conn_ts.execute(
+            "SELECT video_id, watched_at FROM watch_history WHERE watched_at IS NOT NULL"
+        ).fetchall()
+        conn_ts.close()
+        ts_map = {r["video_id"]: r["watched_at"] for r in ts_rows}
+        for vid in list(seeds):
+            ts = ts_map.get(vid)
+            if ts:
+                age_secs = max(0.0, now - ts)
+                seeds[vid] *= _math.exp(-decay_k * age_secs)
 
     seeds = {k: v for k, v in seeds.items() if v > 0}
     total = sum(seeds.values())
@@ -472,8 +542,13 @@ def compute_global_ppr(graph):
     return compute_ppr(graph, uniform_seeds)
 
 
-def update_ppr_scores(min_seed_rating: int = 0, compute_spam_mass: bool = True):
-    """Recompute PPR scores and cache in the database.
+def update_ppr_scores(
+    graph_id: int = 1,
+    content_type: str = "mixed",
+    min_seed_rating: int = 0,
+    compute_spam_mass: bool = True,
+):
+    """Recompute PPR scores for a named graph and cache in the database.
 
     Pass 1 (always): Trusted PPR — seeds from rated/watched/playlist content.
     Pass 2 (optional): Global PPR — uniform seeds over all nodes, used to
@@ -484,24 +559,39 @@ def update_ppr_scores(min_seed_rating: int = 0, compute_spam_mass: bool = True):
       spam_mass is then stored as NULL for all rows.
 
     Args:
+        graph_id: which graph to store scores for (default 1 = 'default').
+        content_type: edge filter — 'mixed', 'music', or 'video'.
         min_seed_rating: if > 0, only videos with effective_rating >= this
                          value contribute to trusted seeds.
         compute_spam_mass: whether to run the second (global) PPR pass.
     """
-    graph = build_graph()
-    seeds = get_seed_weights(min_seed_rating=min_seed_rating)
+    graph = build_graph(content_type=content_type)
+    from backend.db import get_pipeline_config
+    from backend.routers.ppr import _get_ppr_config
+    cfg = get_pipeline_config(graph_id=graph_id)
+    ppr_cfg = _get_ppr_config(graph_id)
+    halflife = cfg.get("temporal.recency_halflife_days", 0.0)
+    alpha = float(ppr_cfg.get("alpha", 0.25))
+    seeds = get_seed_weights(
+        min_seed_rating=min_seed_rating,
+        recency_halflife_days=halflife,
+        graph_id=graph_id,
+        watch_base=float(ppr_cfg.get("watch_base", WATCH_BASE)),
+        playlist_base=float(ppr_cfg.get("playlist_base", PLAYLIST_BASE)),
+        feed_rec_base=float(ppr_cfg.get("feed_rec_base", FEED_REC_BASE)),
+    )
 
     if not seeds:
         return
 
-    trusted_scores = compute_ppr(graph, seeds)
+    trusted_scores = compute_ppr(graph, seeds, alpha=alpha)
     global_scores = compute_global_ppr(graph) if compute_spam_mass else {}
 
     conn = get_db()
     watched = {r["video_id"] for r in conn.execute("SELECT video_id FROM watch_history").fetchall()}
 
     now = time.time()
-    conn.execute("DELETE FROM ppr_scores")
+    conn.execute("DELETE FROM ppr_scores WHERE graph_id = ?", (graph_id,))
 
     rows = []
     for vid, trusted in trusted_scores.items():
@@ -512,46 +602,44 @@ def update_ppr_scores(min_seed_rating: int = 0, compute_spam_mass: bool = True):
             spam_mass = max(0.0, min(1.0, (g - trusted) / g)) if g > 0 else None
         else:
             spam_mass = None
-        rows.append((vid, trusted, spam_mass, now))
+        rows.append((vid, graph_id, trusted, spam_mass, now))
 
     conn.executemany(
-        "INSERT INTO ppr_scores (video_id, score, spam_mass, computed_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO ppr_scores (video_id, graph_id, score, spam_mass, computed_at) VALUES (?, ?, ?, ?, ?)",
         rows,
     )
     conn.commit()
 
-    # Prune feed_recommendations to the 2000 highest-scoring unique videos.
-    # Uses effective_ppr_score = ppr_score * rating_mult(channel/video rating)
-    # so that videos from explicitly rated channels are not pruned unfairly
-    # even when their raw PPR score is lower than structurally-central unrated ones.
-    # Watched videos are excluded from the kept set since the feed filters them anyway.
-    conn.execute("""
-        DELETE FROM feed_recommendations
-        WHERE video_id NOT IN (
-            SELECT fr.video_id
-            FROM feed_recommendations fr
-            LEFT JOIN ppr_scores p ON p.video_id = fr.video_id
-            LEFT JOIN watch_history wh ON wh.video_id = fr.video_id
-            LEFT JOIN video_ratings vr ON vr.video_id = fr.video_id
-            LEFT JOIN channel_ratings cr ON cr.channel_id = fr.author_id
-            WHERE wh.video_id IS NULL
-            GROUP BY fr.video_id
-            ORDER BY COALESCE(MAX(p.score), 0) * CASE
-                WHEN COALESCE(vr.rating, cr.rating) IS NULL THEN 1.0
-                WHEN CAST(COALESCE(vr.rating, cr.rating) AS INTEGER) <= 1 THEN 0.0
-                WHEN CAST(COALESCE(vr.rating, cr.rating) AS INTEGER) <= 5
-                    THEN CAST(COALESCE(vr.rating, cr.rating) AS REAL) / 5.0
-                ELSE (CAST(COALESCE(vr.rating, cr.rating) AS INTEGER) - 4)
-                   * (CAST(COALESCE(vr.rating, cr.rating) AS INTEGER) - 4) * 1.0
-            END DESC, MAX(fr.added_at) DESC
-            LIMIT 2000
-        )
-    """)
-    conn.commit()
+    # Only prune feed_recommendations when updating the default graph (graph_id=1).
+    # Prunes to 2000 highest-scoring unique unwatched videos using effective score.
+    if graph_id == 1:
+        conn.execute("""
+            DELETE FROM feed_recommendations
+            WHERE video_id NOT IN (
+                SELECT fr.video_id
+                FROM feed_recommendations fr
+                LEFT JOIN ppr_scores p ON p.video_id = fr.video_id AND p.graph_id = 1
+                LEFT JOIN watch_history wh ON wh.video_id = fr.video_id
+                LEFT JOIN video_ratings vr ON vr.video_id = fr.video_id
+                LEFT JOIN channel_ratings cr ON cr.channel_id = fr.author_id
+                WHERE wh.video_id IS NULL
+                GROUP BY fr.video_id
+                ORDER BY COALESCE(MAX(p.score), 0) * CASE
+                    WHEN COALESCE(vr.rating, cr.rating) IS NULL THEN 1.0
+                    WHEN CAST(COALESCE(vr.rating, cr.rating) AS INTEGER) <= 1 THEN 0.0
+                    WHEN CAST(COALESCE(vr.rating, cr.rating) AS INTEGER) <= 5
+                        THEN CAST(COALESCE(vr.rating, cr.rating) AS REAL) / 5.0
+                    ELSE (CAST(COALESCE(vr.rating, cr.rating) AS INTEGER) - 4)
+                       * (CAST(COALESCE(vr.rating, cr.rating) AS INTEGER) - 4) * 1.0
+                END DESC, MAX(fr.added_at) DESC
+                LIMIT 2000
+            )
+        """)
+        conn.commit()
     conn.close()
 
 
-def explain_recommendation(video_id: str) -> dict:
+def explain_recommendation(video_id: str, graph_id: int = 1) -> dict:
     """Return the top seed videos that contributed to this video's recommendation score."""
     conn = get_db()
 
@@ -660,7 +748,8 @@ def explain_recommendation(video_id: str) -> dict:
 
     conn3 = get_db()
     rules = conn3.execute(
-        "SELECT rule_type, match_value, multiplier FROM weight_rules ORDER BY multiplier DESC LIMIT 5"
+        "SELECT rule_type, match_value, multiplier FROM weight_rules WHERE graph_id = ? ORDER BY multiplier DESC LIMIT 5",
+        (graph_id,),
     ).fetchall()
     conn3.close()
 

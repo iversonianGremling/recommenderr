@@ -111,6 +111,13 @@ SOURCES_DECL: dict[str, SourceDecl] = {
         env_vars=[],
         default_weight=0.90,
     ),
+    "user_signals": SourceDecl(
+        display_name="User Signals",
+        kind="feedback",
+        env_vars=[],
+        default_weight=1.0,
+        default_circuit_threshold=99,
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -242,6 +249,33 @@ def reset_circuit(source_name: str) -> None:
         circuit_open_until=None,
         last_error=None,
     )
+
+
+def list_sources_for_graph(graph_id: int) -> list[dict]:
+    """Return sources that are assigned to this graph and not globally disabled."""
+    from backend.db import get_db
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT source_name, weight_override FROM graph_sources WHERE graph_id=?", (graph_id,)
+    ).fetchall()
+    conn.close()
+    graph_map = {r["source_name"]: r["weight_override"] for r in rows}
+    all_srcs = list_sources()
+    result = []
+    now = time.time()
+    for s in all_srcs:
+        if s["name"] not in graph_map:
+            continue
+        if not s.get("enabled", True):
+            continue
+        if s.get("circuit_open"):
+            continue
+        s = dict(s)
+        wo = graph_map[s["name"]]
+        if wo is not None:
+            s["weight"] = wo
+        result.append(s)
+    return result
 
 
 def list_sources() -> list[dict]:

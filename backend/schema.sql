@@ -2,6 +2,14 @@
 -- Owns: external world cache + computed signals + recommendation graph.
 -- Cross-DB references to ytvideo (subscriptions, categories) are opaque IDs (no FK).
 
+CREATE TABLE IF NOT EXISTS invidious_cache (
+    cache_key    TEXT PRIMARY KEY,
+    response_json TEXT NOT NULL,
+    fetched_at   REAL NOT NULL,
+    expires_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invcache_expires ON invidious_cache(expires_at);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
     applied_at REAL NOT NULL
@@ -63,13 +71,119 @@ CREATE TABLE IF NOT EXISTS recommendation_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_re_target ON recommendation_edges(target_video_id);
 
+-- Named graphs: each graph has a content_type filter applied at PPR compute time.
+-- content_type: 'mixed' (all edges), 'music' (music-confirmed only), 'video' (non-music only)
+CREATE TABLE IF NOT EXISTS graphs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE,
+    content_type TEXT NOT NULL DEFAULT 'mixed'
+                 CHECK(content_type IN ('mixed','music','video','album','artist')),
+    config_json  TEXT,
+    created_at   REAL NOT NULL
+);
+INSERT OR IGNORE INTO graphs (id, name, content_type, created_at) VALUES
+    (1, 'Mixed',   'mixed',  strftime('%s','now')),
+    (2, 'Songs',   'music',  strftime('%s','now')),
+    (3, 'Videos',  'video',  strftime('%s','now')),
+    (4, 'Albums',  'music',  strftime('%s','now')),
+    (5, 'Artists', 'music',  strftime('%s','now'));
+
 CREATE TABLE IF NOT EXISTS ppr_scores (
-    video_id TEXT PRIMARY KEY,
+    video_id     TEXT NOT NULL,
+    graph_id     INTEGER NOT NULL DEFAULT 1 REFERENCES graphs(id) ON DELETE CASCADE,
+    score        REAL NOT NULL,
+    computed_at  REAL NOT NULL,
+    spam_mass    REAL,
+    PRIMARY KEY (video_id, graph_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ppr_score ON ppr_scores(graph_id, score DESC);
+
+
+CREATE TABLE IF NOT EXISTS cosine_scores (
+    video_id    TEXT NOT NULL,
+    graph_id    INTEGER NOT NULL DEFAULT 1 REFERENCES graphs(id) ON DELETE CASCADE,
+    score       REAL NOT NULL,
+    computed_at REAL NOT NULL,
+    PRIMARY KEY (video_id, graph_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cosine_score ON cosine_scores(graph_id, score DESC);
+
+-- Content embeddings (semantic recs). video_embeddings is graph-agnostic (one
+-- vector per video); embedding_scores is the per-graph Rocchio-cosine result.
+CREATE TABLE IF NOT EXISTS video_embeddings (
+    video_id   TEXT PRIMARY KEY,
+    model      TEXT NOT NULL,
+    dim        INTEGER NOT NULL,
+    vec        BLOB NOT NULL,
+    text_hash  TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS embedding_scores (
+    video_id    TEXT NOT NULL,
+    graph_id    INTEGER NOT NULL DEFAULT 1 REFERENCES graphs(id) ON DELETE CASCADE,
+    score       REAL NOT NULL,
+    computed_at REAL NOT NULL,
+    PRIMARY KEY (video_id, graph_id)
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_score ON embedding_scores(graph_id, score DESC);
+
+-- Per-graph content source enablement.  Global sources.enabled still acts as a circuit-breaker;
+-- a source skipped globally is never active even if listed here.
+CREATE TABLE IF NOT EXISTS graph_sources (
+    graph_id        INTEGER NOT NULL REFERENCES graphs(id) ON DELETE CASCADE,
+    source_name     TEXT NOT NULL REFERENCES sources(name) ON DELETE CASCADE,
+    weight_override REAL,   -- NULL = use global sources.weight
+    PRIMARY KEY (graph_id, source_name)
+);
+
+-- Per-graph feed membership.  feed_recommendations holds metadata; this table records
+-- which graphs each video belongs to.
+CREATE TABLE IF NOT EXISTS graph_feed_items (
+    graph_id        INTEGER NOT NULL REFERENCES graphs(id) ON DELETE CASCADE,
+    video_id        TEXT NOT NULL,
+    source_video_id TEXT NOT NULL,
+    added_at        REAL NOT NULL,
+    PRIMARY KEY (graph_id, video_id, source_video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gfi_graph ON graph_feed_items(graph_id, added_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gfi_video ON graph_feed_items(graph_id, video_id);
+
+CREATE TABLE IF NOT EXISTS pipeline_config (
+    graph_id    INTEGER NOT NULL DEFAULT 1 REFERENCES graphs(id) ON DELETE CASCADE,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (graph_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS serendipity_scores (
+    video_id    TEXT NOT NULL,
+    graph_id    INTEGER NOT NULL DEFAULT 1 REFERENCES graphs(id) ON DELETE CASCADE,
+    score       REAL NOT NULL,
+    computed_at REAL NOT NULL,
+    PRIMARY KEY (video_id, graph_id)
+);
+CREATE INDEX IF NOT EXISTS idx_serendipity_score ON serendipity_scores(graph_id, score DESC);
+
+
+CREATE TABLE IF NOT EXISTS custom_modules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL CHECK(type IN ('scorer', 'filter')),
+    code TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS custom_module_scores (
+    module_id INTEGER NOT NULL REFERENCES custom_modules(id) ON DELETE CASCADE,
+    video_id TEXT NOT NULL,
     score REAL NOT NULL,
     computed_at REAL NOT NULL,
-    spam_mass REAL
+    PRIMARY KEY (module_id, video_id)
 );
-CREATE INDEX IF NOT EXISTS idx_ppr_score ON ppr_scores(score DESC);
+CREATE INDEX IF NOT EXISTS idx_cms_score ON custom_module_scores(module_id, score DESC);
 
 CREATE TABLE IF NOT EXISTS feed_recommendations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,11 +231,12 @@ CREATE TABLE IF NOT EXISTS category_rec_jobs (
 
 CREATE TABLE IF NOT EXISTS weight_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    graph_id    INTEGER NOT NULL DEFAULT 1 REFERENCES graphs(id) ON DELETE CASCADE,
     rule_type TEXT NOT NULL,
     match_value TEXT NOT NULL,
     multiplier REAL NOT NULL DEFAULT 2.0,
     created_at REAL NOT NULL,
-    UNIQUE(rule_type, match_value)
+    UNIQUE(graph_id, rule_type, match_value)
 );
 
 CREATE TABLE IF NOT EXISTS attributes (
@@ -290,10 +405,11 @@ CREATE TABLE IF NOT EXISTS channel_ratings (
 
 CREATE TABLE IF NOT EXISTS feed_filters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    graph_id    INTEGER NOT NULL DEFAULT 1 REFERENCES graphs(id) ON DELETE CASCADE,
     filter_type TEXT NOT NULL,
     match_value TEXT NOT NULL,
     created_at REAL NOT NULL,
-    UNIQUE(filter_type, match_value)
+    UNIQUE(graph_id, filter_type, match_value)
 );
 
 CREATE TABLE IF NOT EXISTS album_ratings (
@@ -451,7 +567,19 @@ CREATE TABLE IF NOT EXISTS custom_categories (
 -- NOTE: this table is read by routers/ppr.py but was previously missing from
 -- schema.sql (it was created by hand in prod). Declaring it here ensures fresh
 -- DBs are fully initialised.
+-- Per-graph PPR engine config. Each graph tunes its own seed weights / alpha
+-- independently (migrate_to_v12 split this out from the old global table).
 CREATE TABLE IF NOT EXISTS ppr_config (
+    graph_id   INTEGER NOT NULL DEFAULT 1 REFERENCES graphs(id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (graph_id, key)
+);
+
+-- Catalog / library PPR engine config (yamtrack-fed library recommender). Its
+-- own independent engine, so its own single-namespace key/value store.
+CREATE TABLE IF NOT EXISTS catalog_ppr_config (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
     updated_at REAL NOT NULL DEFAULT 0
@@ -513,6 +641,38 @@ CREATE TABLE IF NOT EXISTS sources (
     metadata_json       TEXT                           -- env_var declarations, etc.
 );
 
+-- ----- Configurable user signal sources -----
+-- Each row is an endpoint from which user interaction data is fetched.
+-- System sources (is_system=1) are seeded by migration and cannot be deleted.
+CREATE TABLE IF NOT EXISTS signal_sources (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    kind            TEXT NOT NULL CHECK(kind IN ('watch_history','likes','playlists','custom')),
+    endpoint_url    TEXT NOT NULL,
+    converter       TEXT NOT NULL DEFAULT 'ytfront_v1'
+                    CHECK(converter IN ('ytfront_v1','ytfront_likes_v1','native')),
+    auth_header     TEXT,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    is_system       INTEGER NOT NULL DEFAULT 0,
+    created_at      REAL NOT NULL,
+    last_synced_at  REAL,
+    last_count      INTEGER,
+    last_error      TEXT
+);
+
+-- ----- Pipeline consumers (documentary downstream feed readers) -----
+
+CREATE TABLE IF NOT EXISTS pipeline_consumers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    graph_id   INTEGER REFERENCES graphs(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    url        TEXT NOT NULL DEFAULT '',
+    method     TEXT NOT NULL DEFAULT 'GET',
+    path       TEXT NOT NULL DEFAULT '',
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL DEFAULT 0
+);
+
 -- ----- Personas (synthetic seed bundles for topic-sensitive PPR) -----
 
 CREATE TABLE IF NOT EXISTS personas (
@@ -552,3 +712,33 @@ CREATE TABLE IF NOT EXISTS persona_jobs (
     last_error      TEXT,
     claimed_version INTEGER
 );
+
+-- ----- External library seeds (synced from yamtrack etc.) + computed recs -----
+-- Owns the user's external music taste profile (albums/songs/artists with scores)
+-- pushed in over REST, plus the recommendations computed from it.
+
+CREATE TABLE IF NOT EXISTS external_music_seeds (
+    source     TEXT NOT NULL DEFAULT 'yamtrack',
+    kind       TEXT NOT NULL CHECK(kind IN ('song','album','artist')),
+    artist     TEXT NOT NULL DEFAULT '',
+    album      TEXT NOT NULL DEFAULT '',
+    track      TEXT NOT NULL DEFAULT '',
+    score      REAL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (source, kind, artist, album, track)
+);
+CREATE INDEX IF NOT EXISTS idx_ext_seeds_kind ON external_music_seeds(kind);
+
+CREATE TABLE IF NOT EXISTS library_rec_results (
+    kind        TEXT NOT NULL CHECK(kind IN ('song','album','artist')),
+    artist      TEXT NOT NULL DEFAULT '',
+    album       TEXT NOT NULL DEFAULT '',
+    track       TEXT NOT NULL DEFAULT '',
+    score       REAL NOT NULL,
+    cover_art   TEXT,
+    video_id    TEXT,
+    sources     TEXT,
+    computed_at REAL NOT NULL,
+    PRIMARY KEY (kind, artist, album, track)
+);
+CREATE INDEX IF NOT EXISTS idx_librecs_kind_score ON library_rec_results(kind, score DESC);

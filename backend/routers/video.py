@@ -10,16 +10,15 @@ from fastapi.responses import StreamingResponse, Response, RedirectResponse, Fil
 from backend.services import ytdlp_service
 from backend.db import (
     delete_video_media_override,
-    get_music_library_genres_for_video_ids,
-    get_music_tags_for_video_ids,
     get_video_media_override,
     set_video_media_override,
+    get_invidious_cache,
+    set_invidious_cache,
 )
-from backend.services.invidious_client import api_get
+from backend.services.invidious_client import api_get, api_get_cached
 from backend.services.music_client import (
     deezer_get_album_tracks,
     deezer_search_album,
-    infer_catalog_genre_hint,
     itunes_search_album,
     spotify_get_album_tracks,
     spotify_search_album,
@@ -78,38 +77,6 @@ def _music_cover_score(album_hint: str, artist_hint: str, candidate: dict) -> fl
     if clean_artist and cand_artist and (clean_artist == cand_artist or clean_artist in cand_artist or cand_artist in clean_artist):
         artist_score = max(artist_score, 0.95)
     return (album_score * 0.8) + (artist_score * 0.2)
-
-
-async def _search_music_cover(album: str, artist: str) -> tuple[str, str, str]:
-    if not album:
-        return "", "", ""
-    query = f"{artist} {album}".strip()
-    results = await asyncio.gather(
-        itunes_search_album(query, limit=3),
-        deezer_search_album(query, limit=3),
-        spotify_search_album(query, limit=3),
-        return_exceptions=True,
-    )
-
-    best = None
-    best_score = 0.0
-    best_source = ""
-    for batch in results:
-        if isinstance(batch, Exception):
-            continue
-        for item in batch:
-            if not item.get("cover_art"):
-                continue
-            score = _music_cover_score(album, artist, item)
-            if score > best_score:
-                best = item
-                best_score = score
-                best_source = item.get("source") or ""
-
-    if best and best_score >= 0.62:
-        label = best_source or "metadata"
-        return best.get("cover_art") or "", "metadata", f"Album art matched from {label}"
-    return "", "", ""
 
 
 def _description_has_timestamps(description: str | None) -> bool:
@@ -242,62 +209,9 @@ async def _build_album_track_markers(data: dict) -> tuple[list[dict], str]:
     return markers, source
 
 
-def _playback_kind(data: dict, media_override: str | None) -> tuple[str, bool]:
-    # If explicitly marked as not music, treat as video
-    if media_override == "not_music":
-        return "video", False
-    has_music_metadata = any([
-        (data.get("genre") or "").lower() == "music",
-        data.get("track"),
-        data.get("song"),
-        data.get("artist"),
-        data.get("album"),
-        data.get("musicVideoType"),
-    ])
-    is_music_video = media_override == "music_video" or bool(data.get("musicVideoType"))
-    if has_music_metadata and not is_music_video:
-        return "music", False
-    return "video", is_music_video
-
-
 async def _build_video_payload(video_id: str, data: dict, formats: list[dict], subtitles: list[dict]) -> dict:
     media_override = get_video_media_override(video_id)
-    playback_kind, is_music_video = _playback_kind(data, media_override)
-    cover_art = ""
-    cover_art_origin = ""
-    cover_art_note = ""
-    if playback_kind == "music":
-        cover_art, cover_art_origin, cover_art_note = await _search_music_cover(
-            data.get("album") or "",
-            data.get("artist") or data.get("author") or "",
-        )
-        if not cover_art:
-            cover_art = _pick_primary_thumb(data)
-            if cover_art:
-                cover_art_origin = "youtube_thumbnail"
-                cover_art_note = "Using the YouTube thumbnail as cover art"
     album_track_markers, album_track_markers_source = await _build_album_track_markers(data)
-
-    library_genre: str | None = None
-    music_tags_assigned: list[dict] = []
-    catalog_genre_hint: str | None = None
-    if playback_kind == "music":
-        lib_genres = get_music_library_genres_for_video_ids([video_id])
-        library_genre = lib_genres.get(video_id)
-        tag_map = get_music_tags_for_video_ids([video_id])
-        music_tags_assigned = tag_map.get(video_id, [])
-        raw_g = (data.get("genre") or "").strip().lower()
-        if raw_g in ("", "music", "music video") and not library_genre:
-            try:
-                catalog_genre_hint = await infer_catalog_genre_hint(
-                    data.get("track") or data.get("song"),
-                    data.get("song"),
-                    data.get("artist"),
-                    data.get("title"),
-                    data.get("author"),
-                )
-            except Exception:
-                catalog_genre_hint = None
 
     thumbs = [
         {"quality": t.get("quality"), "url": _abs(t.get("url", ""))}
@@ -324,17 +238,11 @@ async def _build_video_payload(video_id: str, data: dict, formats: list[dict], s
         "formats": formats,
         "subtitles": subtitles,
         "media_override": media_override,
-        "playback_kind": playback_kind,
-        "is_music_video": is_music_video,
-        "download_mode": "audio" if playback_kind == "music" else "video",
-        "cover_art": cover_art,
-        "cover_art_origin": cover_art_origin,
-        "cover_art_note": cover_art_note,
+        "playback_kind": "video",
+        "is_music_video": False,
+        "download_mode": "video",
         "album_track_markers": album_track_markers,
         "album_track_markers_source": album_track_markers_source,
-        "library_genre": library_genre,
-        "music_tags": music_tags_assigned,
-        "catalog_genre_hint": catalog_genre_hint,
     }
 
 
@@ -480,6 +388,50 @@ async def prefetch(video_id: str):
     return {}
 
 
+async def _fallback_metadata(video_id: str) -> dict:
+    """Return cached metadata from ytvideo watch_history when both Invidious and yt-dlp fail."""
+    ytvideo_db = os.getenv("YTVIDEO_DB_PATH", "/opt/ytvideo/data/ytvideo.db")
+    try:
+        import sqlite3
+        loop = asyncio.get_running_loop()
+        def _query():
+            conn = sqlite3.connect(ytvideo_db)
+            try:
+                return conn.execute(
+                    "SELECT title, thumbnail, author, duration FROM watch_history WHERE video_id = ? LIMIT 1",
+                    (video_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        row = await loop.run_in_executor(None, _query)
+        if row:
+            title, thumbnail, author, duration = row
+            return {
+                "title": title or video_id,
+                "videoThumbnails": [{"quality": "medium", "url": thumbnail}] if thumbnail else [],
+                "author": author or "",
+                "authorId": "",
+                "lengthSeconds": int(duration) if duration else 0,
+                "description": "",
+                "genre": "",
+            }
+    except Exception as e:
+        logger.warning(f"[video_info] watch_history fallback failed for {video_id}: {e}")
+    return {"title": video_id, "videoThumbnails": [], "author": "", "authorId": "", "lengthSeconds": 0, "description": "", "genre": ""}
+
+
+def _fh_record(method: str, ok: bool, err: str = "") -> None:
+    """Report a fetch outcome to the fetch-health bus (best-effort)."""
+    try:
+        from backend.services import fetch_health
+        if ok:
+            fetch_health.record_success(method)
+        else:
+            fetch_health.record_failure(method, err)
+    except Exception:  # noqa: BLE001 — health reporting must never break a fetch
+        pass
+
+
 @router.get("/{video_id}/info")
 async def video_info(video_id: str):
     # Start yt-dlp extraction immediately so it runs concurrently with the
@@ -488,17 +440,86 @@ async def video_info(video_id: str):
     asyncio.create_task(_bg_extract(video_id))
     asyncio.create_task(_bg_storyboard(video_id))
     asyncio.create_task(_bg_lq_download(video_id))
+
+    # Aggressive per-video payload cache. The assembled payload (description,
+    # album-track markers built from external music APIs, thumbnails, subtitles)
+    # is deterministic per video and expensive to rebuild, yet today it is
+    # recomputed on every hit even though the raw Invidious data is cached. Cache
+    # the whole payload for 6h (aligned with the raw Invidious TTL, so embedded
+    # format URLs are no staler than before). media_override is user-mutable, so
+    # it is refreshed live on every read rather than served from cache.
+    _payload_cache_key = f"video_payload:{video_id}"
+    _cached_payload = get_invidious_cache(_payload_cache_key)
+    if _cached_payload is not None:
+        _cached_payload["media_override"] = get_video_media_override(video_id)
+        return _cached_payload
+
+    inv_err_str: str | None = None
+    camoufox_err_str: str | None = None
+    ytdlp_err_str: str | None = None
+    served_by = "invidious"
+
+    # Fetch cascade: Invidious → yt-dlp → camoufox → static fallback.
+    # yt-dlp is fast (it reuses the background extraction already in flight) and,
+    # with the rotating Mullvad exit + PO tokens, now reliable — so it's the
+    # primary fast path. camoufox (a real browser, but slow: up to ~70s and it
+    # runs every strategy before giving up) is the deep fallback for when yt-dlp
+    # is genuinely bot-blocked, where its browser fingerprint still gets through.
     try:
-        data = await api_get(f"/videos/{video_id}")
+        data = await api_get_cached(f"/videos/{video_id}", ttl=6 * 3600)
+        _fh_record("invidious", True)
     except Exception as inv_err:
-        logger.warning(f"[video_info] Invidious failed for {video_id}: {inv_err}, falling back to yt-dlp")
+        inv_err_str = str(inv_err)
+        _fh_record("invidious", False, inv_err_str)
+        logger.warning(f"[video_info] Invidious failed for {video_id}: {inv_err}, trying yt-dlp")
         try:
             data = await _ytdlp_video_meta(video_id)
+            served_by = "ytdlp"
         except Exception as ytdlp_err:
-            raise HTTPException(status_code=502, detail=f"Invidious: {inv_err}; yt-dlp: {ytdlp_err}")
+            ytdlp_err_str = str(ytdlp_err)
+            logger.warning(f"[video_info] yt-dlp failed for {video_id}: {ytdlp_err}, trying camoufox")
+            try:
+                from backend.services.invidious_client import camoufox_get
+                data = await camoufox_get(f"/videos/{video_id}")
+                served_by = "camoufox"
+                _fh_record("camoufox", True)
+                logger.info(f"[video_info] camoufox succeeded for {video_id}")
+            except Exception as camou_err:
+                camoufox_err_str = str(camou_err)
+                _fh_record("camoufox", False, camoufox_err_str)
+                logger.warning(f"[video_info] camoufox also failed for {video_id}: {camou_err}")
+                served_by = "fallback"
+                data = await _fallback_metadata(video_id)
 
     formats = _parse_invidious_formats(data, video_id)
-    return await _build_video_payload(video_id, data, formats, _parse_subtitles(data, video_id))
+    payload = await _build_video_payload(video_id, data, formats, _parse_subtitles(data, video_id))
+
+    payload["source"] = served_by
+    if inv_err_str is not None:
+        bot_detected = ytdlp_err_str is not None and (
+            "Sign in to confirm" in ytdlp_err_str or "not a bot" in ytdlp_err_str
+        )
+        payload["stream_error"] = {
+            "invidious": inv_err_str,
+            "camoufox": camoufox_err_str,
+            "ytdlp": ytdlp_err_str,
+            "bot_detected": bot_detected,
+            "served_by": served_by,
+        }
+
+    # Cache any complete payload except the degraded static fallback. yt-dlp and
+    # camoufox results are full metadata too, and Invidious is frequently
+    # rate-limited, so gating on invidious-only would leave the cache empty.
+    # Strip the transient stream_error so cache hits serve clean metadata.
+    if served_by != "fallback" and payload.get("title"):
+        try:
+            _to_cache = dict(payload)
+            _to_cache.pop("stream_error", None)
+            set_invidious_cache(_payload_cache_key, _to_cache, 6 * 3600)
+        except Exception:
+            logger.warning(f"[video_info] payload cache write failed for {video_id}", exc_info=True)
+
+    return payload
 
 
 async def _bg_extract(video_id: str):
@@ -510,7 +531,7 @@ async def _bg_extract(video_id: str):
 
 async def _bg_storyboard(video_id: str):
     try:
-        from services import storyboard_service
+        from backend.services import storyboard_service
         await storyboard_service.generate_bg(video_id)
     except Exception:
         pass
@@ -518,7 +539,7 @@ async def _bg_storyboard(video_id: str):
 
 async def _bg_lq_download(video_id: str):
     try:
-        from services import lq_service
+        from backend.services import lq_service
         await lq_service.download_bg(video_id)
     except Exception:
         pass
@@ -657,13 +678,17 @@ async def mux_stream(video_id: str, quality: int = Query(default=720), start: fl
     logger.info(f"[mux] {video_id} quality={quality} start={start:.1f}s {vcodec}+{acodec} ({action})→webm")
 
     # Build ffmpeg args — fast-seek both inputs to the requested start position
+    # -reconnect/-reconnect_streamed: retry if YouTube CDN drops the audio or video URL
+    # mid-stream; without these ffmpeg silently produces muted output when the audio
+    # connection drops.
+    reconnect = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
     ff = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     if start > 0:
         ff += ["-ss", f"{start:.3f}"]
-    ff += ["-i", video_url]
+    ff += reconnect + ["-i", video_url]
     if start > 0:
         ff += ["-ss", f"{start:.3f}"]
-    ff += ["-i", audio_url] + video_codec_args + audio_codec_args + ["-avoid_negative_ts", "make_zero", "-f", "webm", "pipe:1"]
+    ff += reconnect + ["-i", audio_url] + video_codec_args + audio_codec_args + ["-map", "0:v:0", "-map", "1:a:0", "-avoid_negative_ts", "make_zero", "-f", "webm", "pipe:1"]
 
     proc = await asyncio.create_subprocess_exec(
         *ff,
@@ -734,8 +759,7 @@ async def trigger_download(video_id: str):
         data = await api_get(f"/videos/{video_id}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Invidious error: {e}")
-    playback_kind, _ = _playback_kind(data, get_video_media_override(video_id))
-    await ytdlp_service.start_download(video_id, mode="audio" if playback_kind == "music" else "video")
+    await ytdlp_service.start_download(video_id, mode="video")
     return ytdlp_service.get_download_state(video_id)
 
 
@@ -778,13 +802,13 @@ async def local_stream(video_id: str, request: Request):
 
 @router.get("/{video_id}/lq/status")
 async def lq_status(video_id: str):
-    from services import lq_service
+    from backend.services import lq_service
     return lq_service.get_status(video_id)
 
 
 @router.get("/{video_id}/lq")
 async def lq_video(video_id: str):
-    from services import lq_service
+    from backend.services import lq_service
     path = lq_service.get_lq_path(video_id)
     if not path:
         raise HTTPException(status_code=404, detail="LQ file not ready")

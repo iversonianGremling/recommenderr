@@ -114,6 +114,11 @@ async def _process_job(job_id: int):
             track = rec.track or info.get("title", "")
             artist = rec.artist or info.get("author", "")
 
+            # Apply the Music Recognition converter's field mapping to the raw video info.
+            from backend.services.mapping_executor import get_mapping_for_source, apply_mapping
+            music_mapping = get_mapping_for_source("lastfm")
+            mapped_info = apply_mapping(info, music_mapping)
+
             # Get genre tags from Last.fm
             tags = await _get_genre_tags(track, artist)
             genre = _pick_genre(rec, tags)
@@ -121,11 +126,11 @@ async def _process_job(job_id: int):
             # Store the source video itself in music_library if recognized
             _upsert_library(
                 video_id=video_id,
-                title=info.get("title") or video_row["title"],
-                thumbnail=info.get("videoThumbnails", [{}])[0].get("url") if info.get("videoThumbnails") else None,
-                duration=info.get("lengthSeconds"),
-                author=info.get("author"),
-                author_id=info.get("authorId"),
+                title=mapped_info.get("title") or video_row["title"],
+                thumbnail=mapped_info.get("thumbnail"),
+                duration=mapped_info.get("duration"),
+                author=mapped_info.get("author"),
+                author_id=mapped_info.get("author_id"),
                 track=track,
                 artist=artist,
                 album=rec.album,

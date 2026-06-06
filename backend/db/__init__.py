@@ -166,52 +166,82 @@ def _published_ts_from_invidious_rec(r: dict) -> float | None:
         return None
 
 
-def save_recommendations(source_video_id: str, source_video_title: str, recs: list, max_save: int = 10):
-    """Save a random sample of recommendations from a watched video."""
+def save_recommendations(
+    source_video_id: str,
+    source_video_title: str,
+    recs: list,
+    max_save: int = 10,
+    graph_ids: list[int] | None = None,
+):
+    """Save a random sample of recommendations from a watched video.
+
+    graph_ids: which graphs this source feeds. If None, falls back to graph 1 (Mixed).
+    """
     if not recs:
         return
+    if graph_ids is None:
+        graph_ids = [1]
+
     conn = get_db()
     existing = conn.execute(
         "SELECT 1 FROM feed_recommendations WHERE source_video_id = ? LIMIT 1", (source_video_id,)
     ).fetchone()
     if existing:
+        # Ensure graph membership even if metadata already exists
+        for gid in graph_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO graph_feed_items (graph_id, video_id, source_video_id, added_at) "
+                "SELECT ?, video_id, source_video_id, added_at FROM feed_recommendations "
+                "WHERE source_video_id = ?",
+                (gid, source_video_id),
+            )
+        conn.commit()
         conn.close()
         return
 
     sample = random.sample(recs, min(max_save, len(recs)))
     now = time.time()
+    saved_vids = []
     for r in sample:
-        vid = r.get("videoId") or r.get("video_id", "")
+        # Accept both pre-mapped (standardised) and raw Invidious field names.
+        vid = r.get("video_id") or r.get("videoId", "")
         if not vid:
             continue
-        thumb = ""
-        if r.get("videoThumbnails"):
+        thumb = r.get("thumbnail") or ""
+        if not thumb and r.get("videoThumbnails"):
             thumb = r["videoThumbnails"][0].get("url", "")
-        elif r.get("thumbnail"):
-            thumb = r["thumbnail"]
         pub = _published_ts_from_invidious_rec(r)
         conn.execute(
-            "INSERT INTO feed_recommendations (video_id, title, thumbnail, duration, author, author_id, source_video_id, source_video_title, added_at, published_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO feed_recommendations "
+            "(video_id, title, thumbnail, duration, author, author_id, source_video_id, source_video_title, added_at, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 vid,
                 r.get("title", ""),
                 thumb,
-                r.get("lengthSeconds") or r.get("duration"),
+                r.get("duration") or r.get("lengthSeconds"),
                 r.get("author") or r.get("uploader", ""),
-                r.get("authorId") or r.get("author_id", ""),
+                r.get("author_id") or r.get("authorId", ""),
                 source_video_id,
                 source_video_title,
                 now,
                 pub,
             )
         )
+        saved_vids.append(vid)
+    conn.commit()
+
+    # Per-graph feed membership
+    for gid in graph_ids:
+        for vid in saved_vids:
+            conn.execute(
+                "INSERT OR IGNORE INTO graph_feed_items (graph_id, video_id, source_video_id, added_at) VALUES (?,?,?,?)",
+                (gid, vid, source_video_id, now),
+            )
     conn.commit()
 
     # Insert edges for PPR graph
-    for r in sample:
-        vid = r.get("videoId") or r.get("video_id", "")
-        if not vid:
-            continue
+    for vid in saved_vids:
         conn.execute(
             "INSERT OR IGNORE INTO recommendation_edges (source_video_id, target_video_id, weight, added_at) VALUES (?, ?, ?, ?)",
             (source_video_id, vid, 1.0, now)
@@ -228,23 +258,18 @@ def save_recommendations(source_video_id: str, source_video_title: str, recs: li
 
     # Categorize new videos
     from backend.services.categorizer import bulk_categorize
-    cat_videos = []
-    for r in sample:
-        vid = r.get("videoId") or r.get("video_id", "")
-        if vid:
-            cat_videos.append({
-                "video_id": vid,
-                "title": r.get("title", ""),
-                "author": r.get("author") or r.get("uploader", ""),
-            })
+    cat_videos = [
+        {"video_id": vid, "title": r.get("title", ""), "author": r.get("author") or r.get("uploader", "")}
+        for r in sample
+        if (vid := r.get("videoId") or r.get("video_id", ""))
+    ]
     if cat_videos:
         bulk_categorize(cat_videos)
 
-    # Invalidate PPR scores
-    conn2 = get_db()
-    conn2.execute("DELETE FROM ppr_scores")
-    conn2.commit()
-    conn2.close()
+    # Invalidate PPR scores for affected graphs
+    for gid in graph_ids:
+        conn.execute("DELETE FROM ppr_scores WHERE graph_id=?", (gid,))
+    conn.commit()
 
     conn.close()
 
@@ -331,16 +356,24 @@ def _diversify_ppr_feed_rows(rows: list[dict], out_limit: int) -> list[dict]:
 
 
 def get_ppr_feed(limit: int = 100, offset: int = 0, category: str = None, sort: str = 'score',
-                 max_spam_mass: float = 1.0, _skip_recompute: bool = False):
-    """Return PPR-ranked recommendations, optionally filtered by category."""
+                 max_spam_mass: float = 1.0, _skip_recompute: bool = False,
+                 persona_id: int | None = None, graph_id: int = 1):
+    """Return PPR-ranked recommendations, optionally filtered by category/persona/graph.
+
+    When persona_id is set, scores come from persona_scores for that persona instead of
+    the global ppr_scores table. graph_id selects which graph's ppr_scores to use
+    (default 1 = mixed/default graph).
+    """
     conn = get_db()
 
-    if not _skip_recompute:
-        row = conn.execute("SELECT MIN(computed_at) as oldest FROM ppr_scores").fetchone()
+    if not _skip_recompute and persona_id is None:
+        row = conn.execute(
+            "SELECT MIN(computed_at) as oldest FROM ppr_scores WHERE graph_id=?", (graph_id,)
+        ).fetchone()
         if not row or not row["oldest"] or (time.time() - row["oldest"]) > 300:
             conn.close()
             from backend.services.ppr_engine import update_ppr_scores
-            update_ppr_scores(compute_spam_mass=(max_spam_mass < 1.0))
+            update_ppr_scores(graph_id=graph_id, compute_spam_mass=(max_spam_mass < 1.0))
             conn = get_db()
 
     params = []
@@ -405,6 +438,12 @@ def get_ppr_feed(limit: int = 100, offset: int = 0, category: str = None, sort: 
             )
         )"""
 
+    # Score source: persona_scores when persona_id set, else ppr_scores for graph_id
+    if persona_id is not None:
+        score_join = f"LEFT JOIN persona_scores ppr ON ppr.video_id = fr.video_id AND ppr.persona_id = {int(persona_id)}"
+    else:
+        score_join = f"LEFT JOIN ppr_scores ppr ON ppr.video_id = fr.video_id AND ppr.graph_id = {int(graph_id)}"
+
     query_params = params[:]
     rows = conn.execute(f"""
         SELECT fr.video_id, fr.title, fr.thumbnail, fr.duration,
@@ -417,7 +456,8 @@ def get_ppr_feed(limit: int = 100, offset: int = 0, category: str = None, sort: 
                fr.added_at,
                MAX(fr.published_at) AS published_at
         FROM feed_recommendations fr
-        LEFT JOIN ppr_scores ppr ON ppr.video_id = fr.video_id
+        JOIN graph_feed_items gfi ON gfi.video_id = fr.video_id AND gfi.graph_id = {int(graph_id)}
+        {score_join}
         LEFT JOIN video_categories vc ON vc.video_id = fr.video_id
         LEFT JOIN video_ratings vr_vid ON vr_vid.video_id = fr.video_id
         LEFT JOIN album_tracks at ON at.video_id = fr.video_id
@@ -430,9 +470,14 @@ def get_ppr_feed(limit: int = 100, offset: int = 0, category: str = None, sort: 
         AND wh.video_id IS NULL
         AND NOT EXISTS (
             SELECT 1 FROM feed_filters ff
-            WHERE (ff.filter_type = 'keyword' AND LOWER(fr.title) LIKE '%' || ff.match_value || '%')
+            WHERE ff.graph_id = {int(graph_id)}
+            AND ((ff.filter_type = 'keyword' AND (
+                    LOWER(fr.title) LIKE '%' || ff.match_value || '%'
+                    OR EXISTS (SELECT 1 FROM video_keywords vk
+                               WHERE vk.video_id = fr.video_id
+                                 AND LOWER(vk.keyword) LIKE '%' || ff.match_value || '%')))
                OR (ff.filter_type = 'channel_id' AND fr.author_id = ff.match_value)
-               OR (ff.filter_type = 'channel_name' AND LOWER(fr.author) LIKE '%' || ff.match_value || '%')
+               OR (ff.filter_type = 'channel_name' AND LOWER(fr.author) LIKE '%' || ff.match_value || '%'))
         )
         {_exclude_music_labeled_channels_sql}
         {category_filter}
@@ -443,37 +488,176 @@ def get_ppr_feed(limit: int = 100, offset: int = 0, category: str = None, sort: 
     """, query_params).fetchall()
     conn.close()
     result = [dict(r) for r in rows]
+
+    # Score blending if cosine or serendipity enabled
+    cfg = get_pipeline_config(graph_id=graph_id)
+    w_ppr = cfg.get("scorer.ppr.weight", 1.0) if cfg.get("scorer.ppr.enabled", 1.0) else 0.0
+    w_cosine = cfg.get("scorer.cosine.weight", 0.0) if cfg.get("scorer.cosine.enabled", 0.0) else 0.0
+    w_serendipity = cfg.get("scorer.serendipity.weight", 0.0) if cfg.get("scorer.serendipity.enabled", 0.0) else 0.0
+    w_embedding = cfg.get("scorer.embedding.weight", 0.0) if cfg.get("scorer.embedding.enabled", 0.0) else 0.0
+
+    if (w_cosine > 0 or w_serendipity > 0 or w_embedding > 0) and sort == 'score':
+        cand_ids = [r["video_id"] for r in result]
+        if cand_ids:
+            conn2 = get_db()
+            ph = ",".join("?" * len(cand_ids))
+            cosine_map = {r["video_id"]: r["score"] for r in conn2.execute(
+                f"SELECT video_id, score FROM cosine_scores WHERE graph_id={int(graph_id)} AND video_id IN ({ph})", cand_ids
+            ).fetchall()}
+            seren_map = {r["video_id"]: r["score"] for r in conn2.execute(
+                f"SELECT video_id, score FROM serendipity_scores WHERE graph_id={int(graph_id)} AND video_id IN ({ph})", cand_ids
+            ).fetchall()}
+            emb_map = {r["video_id"]: r["score"] for r in conn2.execute(
+                f"SELECT video_id, score FROM embedding_scores WHERE graph_id={int(graph_id)} AND video_id IN ({ph})", cand_ids
+            ).fetchall()} if w_embedding > 0 else {}
+            conn2.close()
+
+            for r in result:
+                vid = r["video_id"]
+                blended = (
+                    w_ppr * float(r.get("effective_ppr_score") or 0) +
+                    w_cosine * cosine_map.get(vid, 0.0) +
+                    w_serendipity * seren_map.get(vid, 0.0) +
+                    w_embedding * emb_map.get(vid, 0.0)
+                )
+                r["effective_ppr_score"] = blended
+            result.sort(key=lambda r: float(r.get("effective_ppr_score") or 0), reverse=True)
+
     if sort == 'score' and result:
-        result = _diversify_ppr_feed_rows(result, limit)
+        if cfg.get("diversity.enabled", 0.0):
+            result = mmr_rerank(result,
+                                lambda_param=cfg.get("diversity.lambda", 0.7),
+                                max_per_channel=int(cfg.get("diversity.max_per_channel", 3)))
+        else:
+            result = _diversify_ppr_feed_rows(result, limit)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Pipeline config
+# ---------------------------------------------------------------------------
+
+PIPELINE_DEFAULTS = {
+    "temporal.recency_halflife_days": 0.0,
+    "scorer.ppr.enabled": 1.0,
+    "scorer.ppr.weight": 1.0,
+    "scorer.cosine.enabled": 0.0,
+    "scorer.cosine.weight": 0.5,
+    "scorer.serendipity.enabled": 0.0,
+    "scorer.serendipity.weight": 0.5,
+    "scorer.embedding.enabled": 0.0,
+    "scorer.embedding.weight": 0.5,
+    "diversity.enabled": 0.0,
+    "diversity.lambda": 0.7,
+    "diversity.max_per_channel": 3.0,
+}
+
+
+def get_pipeline_config(graph_id: int = 1) -> dict:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT key, value FROM pipeline_config WHERE graph_id=?", (graph_id,)
+    ).fetchall()
+    conn.close()
+    cfg = dict(PIPELINE_DEFAULTS)
+    for r in rows:
+        if r["key"] in cfg:
+            try:
+                cfg[r["key"]] = float(r["value"])
+            except Exception:
+                pass
+    return cfg
+
+
+def set_pipeline_config(updates: dict, graph_id: int = 1) -> None:
+    conn = get_db()
+    now = time.time()
+    for k, v in updates.items():
+        conn.execute(
+            "INSERT OR REPLACE INTO pipeline_config (graph_id, key, value, updated_at) VALUES (?, ?, ?, ?)",
+            (graph_id, k, str(v), now)
+        )
+    conn.commit()
+    conn.close()
+
+
+def mmr_rerank(items: list[dict], lambda_param: float = 0.7, max_per_channel: int = 3) -> list[dict]:
+    """Maximal Marginal Relevance reranker for channel diversity."""
+    if not items:
+        return items
+
+    selected = []
+    remaining = list(items)
+    channel_counts: dict[str, int] = {}
+
+    score_key = "effective_ppr_score"
+
+    while remaining:
+        best = None
+        best_mmr = float('-inf')
+
+        for item in remaining:
+            ch = item.get("author_id") or (item.get("author") or "").strip().lower() or "_unknown"
+            ch_count = channel_counts.get(ch, 0)
+            if max_per_channel > 0 and ch_count >= max_per_channel:
+                continue
+
+            relevance = float(item.get(score_key) or 0)
+
+            if selected:
+                max_sim = max(
+                    1.0 if (s.get("author_id") or (s.get("author") or "").strip().lower() or "_unknown") == ch else 0.0
+                    for s in selected[-10:]
+                )
+            else:
+                max_sim = 0.0
+
+            mmr = lambda_param * relevance - (1 - lambda_param) * max_sim
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best = item
+
+        if best is None:
+            remaining.sort(key=lambda r: float(r.get(score_key) or 0), reverse=True)
+            selected.extend(remaining)
+            break
+
+        selected.append(best)
+        remaining.remove(best)
+        ch = best.get("author_id") or (best.get("author") or "").strip().lower() or "_unknown"
+        channel_counts[ch] = channel_counts.get(ch, 0) + 1
+
+    return selected
 
 
 # ---------------------------------------------------------------------------
 # Weight rules
 # ---------------------------------------------------------------------------
 
-def get_weight_rules():
+def get_weight_rules(graph_id: int = 1):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM weight_rules ORDER BY created_at DESC").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM weight_rules WHERE graph_id=? ORDER BY created_at DESC", (graph_id,)
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def add_weight_rule(rule_type: str, match_value: str, multiplier: float):
+def add_weight_rule(rule_type: str, match_value: str, multiplier: float, graph_id: int = 1):
     conn = get_db()
     conn.execute(
-        "INSERT OR REPLACE INTO weight_rules (rule_type, match_value, multiplier, created_at) VALUES (?,?,?,?)",
-        (rule_type, match_value, multiplier, time.time())
+        "INSERT OR REPLACE INTO weight_rules (graph_id, rule_type, match_value, multiplier, created_at) VALUES (?,?,?,?,?)",
+        (graph_id, rule_type, match_value, multiplier, time.time())
     )
-    conn.execute("DELETE FROM ppr_scores")
+    conn.execute("DELETE FROM ppr_scores WHERE graph_id=?", (graph_id,))
     conn.commit()
     conn.close()
 
 
-def delete_weight_rule(rule_id: int):
+def delete_weight_rule(rule_id: int, graph_id: int = 1):
     conn = get_db()
-    conn.execute("DELETE FROM weight_rules WHERE id = ?", (rule_id,))
-    conn.execute("DELETE FROM ppr_scores")
+    conn.execute("DELETE FROM weight_rules WHERE id = ? AND graph_id = ?", (rule_id, graph_id))
+    conn.execute("DELETE FROM ppr_scores WHERE graph_id=?", (graph_id,))
     conn.commit()
     conn.close()
 
@@ -1051,28 +1235,111 @@ def delete_video_media_override(video_id: str):
 # Feed filters
 # ---------------------------------------------------------------------------
 
-def get_feed_filters():
+def get_feed_filters(graph_id: int = 1):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM feed_filters ORDER BY created_at DESC").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM feed_filters WHERE graph_id=? ORDER BY created_at DESC", (graph_id,)
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def add_feed_filter(filter_type: str, match_value: str):
+def add_feed_filter(filter_type: str, match_value: str, graph_id: int = 1):
     conn = get_db()
     conn.execute(
-        "INSERT OR IGNORE INTO feed_filters (filter_type, match_value, created_at) VALUES (?,?,?)",
-        (filter_type, match_value, time.time()),
+        "INSERT OR IGNORE INTO feed_filters (graph_id, filter_type, match_value, created_at) VALUES (?,?,?,?)",
+        (graph_id, filter_type, match_value, time.time()),
     )
     conn.commit()
     conn.close()
 
 
-def delete_feed_filter(filter_id: int):
+def delete_feed_filter(filter_id: int, graph_id: int = 1):
     conn = get_db()
-    conn.execute("DELETE FROM feed_filters WHERE id = ?", (filter_id,))
+    conn.execute("DELETE FROM feed_filters WHERE id = ? AND graph_id = ?", (filter_id, graph_id))
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph sources (per-graph content source enablement)
+# ---------------------------------------------------------------------------
+
+def list_graph_sources(graph_id: int) -> list[dict]:
+    """Return all sources for a graph, merging global state with per-graph overrides."""
+    from backend.services import source_registry
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT source_name, weight_override FROM graph_sources WHERE graph_id=?", (graph_id,)
+    ).fetchall()
+    conn.close()
+    graph_map = {r["source_name"]: r["weight_override"] for r in rows}
+    all_sources = source_registry.list_sources()
+    result = []
+    for s in all_sources:
+        if s["name"] in graph_map:
+            s = dict(s)
+            s["in_graph"] = True
+            s["weight_override"] = graph_map[s["name"]]
+        else:
+            s = dict(s)
+            s["in_graph"] = False
+            s["weight_override"] = None
+        result.append(s)
+    return result
+
+
+def upsert_graph_source(graph_id: int, source_name: str, weight_override=None) -> None:
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO graph_sources (graph_id, source_name, weight_override) VALUES (?,?,?)",
+        (graph_id, source_name, weight_override),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_graph_source(graph_id: int, source_name: str) -> None:
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM graph_sources WHERE graph_id=? AND source_name=?", (graph_id, source_name)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_graph_source_names(graph_id: int) -> list[str]:
+    """Return source names that are enabled for a graph (globally available + in graph_sources)."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT source_name FROM graph_sources WHERE graph_id=?", (graph_id,)
+    ).fetchall()
+    conn.close()
+    return [r["source_name"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Graph feed items (per-graph feed membership)
+# ---------------------------------------------------------------------------
+
+def add_graph_feed_items(graph_id: int, video_id: str, source_video_id: str, added_at: float) -> None:
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO graph_feed_items (graph_id, video_id, source_video_id, added_at) VALUES (?,?,?,?)",
+        (graph_id, video_id, source_video_id, added_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_graph_ids_for_source(source_name: str) -> list[int]:
+    """Return graph IDs that the given source feeds into."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT graph_id FROM graph_sources WHERE source_name=?", (source_name,)
+    ).fetchall()
+    conn.close()
+    return [r["graph_id"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1089,5 +1356,44 @@ def get_category_descendant_ids(conn, cat_id: int):
             ids.append(c['id'])
             queue.append(c['id'])
     return ids
+
+
+# ---------------------------------------------------------------------------
+# Invidious API response cache
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def get_invidious_cache(cache_key: str) -> dict | None:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT response_json FROM invidious_cache WHERE cache_key = ? AND expires_at > ?",
+        (cache_key, time.time()),
+    ).fetchone()
+    conn.close()
+    if row:
+        return _json.loads(row["response_json"])
+    return None
+
+
+def set_invidious_cache(cache_key: str, data: dict, ttl: float) -> None:
+    now = time.time()
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO invidious_cache (cache_key, response_json, fetched_at, expires_at) VALUES (?, ?, ?, ?)",
+        (cache_key, _json.dumps(data), now, now + ttl),
+    )
+    conn.commit()
+    conn.close()
+
+
+def purge_expired_invidious_cache() -> int:
+    conn = get_db()
+    result = conn.execute("DELETE FROM invidious_cache WHERE expires_at <= ?", (time.time(),))
+    deleted = result.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
 
 

@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 def _fresh_cache():
     """Invalidate feed cache before each test so stale snapshots don't bleed."""
     from backend.services import feed_cache
-    feed_cache._snapshot.computed_at = 0.0
+    feed_cache._snapshots.clear()
     yield
 
 

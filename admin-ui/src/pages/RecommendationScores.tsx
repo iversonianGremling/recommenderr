@@ -3,6 +3,7 @@ import { getPprScores, getPprSeeds, getPprWhy } from '../lib/api'
 import type { PprScore, PprSeed, WhyResult } from '../lib/types'
 import { ItemTable, normalizeItem } from '../components/ItemTable'
 import type { NormalizedItem } from '../components/ItemTable'
+import GraphSelector from '../components/GraphSelector'
 
 function WhyDrawer({ videoId, onClose }: { videoId: string; onClose: () => void }) {
   const [data, setData] = useState<WhyResult | null>(null)
@@ -64,11 +65,12 @@ function WhyDrawer({ videoId, onClose }: { videoId: string; onClose: () => void 
 
 type Tab = 'scores' | 'seeds'
 
-export default function RecommendationScores() {
+export default function RecommendationScores({ graphId: initGraphId }: { graphId?: number } = {}) {
   const [tab, setTab] = useState<Tab>('scores')
   const [scores, setScores] = useState<PprScore[]>([])
   const [seeds, setSeeds] = useState<PprSeed[]>([])
   const [limit, setLimit] = useState(100)
+  const [graphId, setGraphId] = useState(initGraphId ?? 1)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [whyId, setWhyId] = useState<string | null>(null)
@@ -77,10 +79,10 @@ export default function RecommendationScores() {
     setLoading(true)
     setError(null)
     const p = tab === 'scores'
-      ? getPprScores(limit).then(setScores)
+      ? getPprScores(limit, graphId).then(setScores)
       : getPprSeeds(limit).then(setSeeds)
     p.catch((e) => setError(String(e))).finally(() => setLoading(false))
-  }, [tab, limit])
+  }, [tab, limit, graphId])
 
   const scoreItems = scores.map((s) => normalizeItem(s as unknown as Record<string, unknown>))
   const seedItems = seeds.map((s) =>
@@ -109,6 +111,9 @@ export default function RecommendationScores() {
           <option key={n} value={n}>{n} rows</option>
         ))}
       </select>
+      {tab === 'scores' && (
+        <GraphSelector value={graphId} onChange={setGraphId} />
+      )}
     </div>
   )
 

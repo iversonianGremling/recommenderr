@@ -4,10 +4,17 @@ import logging
 import sys
 import json
 import os
+import subprocess
 from typing import Optional, Tuple
 import yt_dlp
 
+from backend.services import exit_manager
+
 logger = logging.getLogger("ytdlp")
+
+# Number of fresh exits to rotate through before giving up on a bot-blocked
+# extraction.  Each rotation asks the gateway for a different relay.
+_BOT_MAX_ROTATIONS = int(os.getenv("YTDLP_BOT_MAX_ROTATIONS", "3"))
 
 
 def _cookie_opts() -> dict:
@@ -20,6 +27,11 @@ def _cookie_opts() -> dict:
     if browser and not cookie_file:
         opts["cookiesfrombrowser"] = (browser,)
     return opts
+
+
+def _proxy_opts() -> dict:
+    """yt-dlp proxy option for the YouTube egress class (rotating Mullvad SOCKS)."""
+    return exit_manager.proxy_opts()
 
 
 # ── Warm-worker pool ───────────────────────────────────────────────────────────
@@ -166,6 +178,55 @@ _info_cache: dict[str, tuple[float, dict]] = {}
 # Track in-progress extractions to avoid parallel duplicates
 _in_progress: dict[str, asyncio.Lock] = {}
 
+# Negative cache: videos that failed extraction (LOGIN_REQUIRED, bot-detected, etc.)
+# Uses a shorter TTL than CACHE_TTL so transient blocks eventually get a retry.
+_EXTRACT_FAIL_TTL = 300  # 5 minutes
+_extract_failed: dict[str, float] = {}  # video_id → failure timestamp
+
+
+def _extraction_failed_recently(video_id: str) -> bool:
+    ts = _extract_failed.get(video_id)
+    if ts is None:
+        return False
+    if time.time() - ts < _EXTRACT_FAIL_TTL:
+        return True
+    del _extract_failed[video_id]
+    return False
+
+
+def _mark_extraction_failed(video_id: str) -> None:
+    _extract_failed[video_id] = time.time()
+
+
+def _is_bot_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in ("sign in to confirm", "not a bot", "login_required", "loginrequired"))
+
+
+def _is_conn_error(exc: Exception) -> bool:
+    """Connection/SOCKS-level failure — the exit IP couldn't reach (or was
+    refused by) YouTube. Distinct from a bot/login wall: rotating to a fresh
+    Mullvad exit usually clears it."""
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "socks server failure", "socks5error", "proxyerror", "proxy error",
+        "connection refused", "connection reset", "connection aborted",
+        "errno 111", "errno 104",
+    ))
+
+
+def _record_ytdlp(ok: bool, err: str = "") -> None:
+    """Report the yt-dlp extraction outcome to the fetch-health bus."""
+    try:
+        from backend.services import fetch_health
+        if ok:
+            fetch_health.record_success("ytdlp")
+        else:
+            fetch_health.record_failure("ytdlp", err)
+    except Exception:  # noqa: BLE001 — health reporting must never break extraction
+        pass
+
+
 # Download state: {video_id: {"status": "none"|"downloading"|"done"|"failed", "progress": int, "path": str|None}}
 _download_state: dict[str, dict] = {}
 _download_in_progress: set[str] = set()
@@ -186,7 +247,9 @@ def _extract(video_id: str) -> dict:
             "no_warnings": True,
             "skip_download": True,
             "js_runtimes": {"node": {}},
+            "remote_components": ["ejs:github"],
             **_cookie_opts(),
+            **_proxy_opts(),
         }) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             fmts = info.get("formats", [])
@@ -201,30 +264,116 @@ def _extract(video_id: str) -> dict:
         raise
 
 
+async def _extract_once(video_id: str) -> dict:
+    """Run a single extraction via the warm worker pool, falling back to a
+    thread executor. Raises on yt-dlp errors (including bot-blocks)."""
+    if _pool._started:
+        try:
+            return await _pool.extract(video_id)
+        except Exception as exc:
+            if _is_bot_error(exc):
+                raise  # let the caller rotate + retry; don't mask as a pool error
+            logger.warning("[extract] worker pool failed (%s), falling back to thread executor", exc)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _extract, video_id)
+
+
 async def extract_formats(video_id: str) -> list[dict]:
-    """Extract via yt-dlp. Deduplicates concurrent calls. Caches results."""
+    """Extract via yt-dlp. Deduplicates concurrent calls. Caches results.
+
+    On a YouTube bot-block, rotate to a fresh Mullvad exit (via the gateway)
+    and retry across up to ``_BOT_MAX_ROTATIONS`` exits before giving up.
+    Marked as an interactive request so background crawlers yield to it.
+    """
+    if _extraction_failed_recently(video_id):
+        raise RuntimeError(f"[extract] {video_id} skipped — failed recently (backoff {_EXTRACT_FAIL_TTL}s)")
+
     if video_id not in _in_progress:
         _in_progress[video_id] = asyncio.Lock()
 
-    async with _in_progress[video_id]:
+    async with _in_progress[video_id], exit_manager.interactive():
         if _cache_fresh(video_id):
             return _build_format_list(video_id)
 
-        if _pool._started:
-            # Use a pre-warmed worker subprocess; blocks until one is idle.
+        last_exc: Optional[Exception] = None
+        for attempt in range(_BOT_MAX_ROTATIONS + 1):
             try:
-                info = await _pool.extract(video_id)
+                info = await _extract_once(video_id)
                 _store_info(video_id, info)
+                _record_ytdlp(True)
+                exit_manager.note_success()
                 return _build_format_list(video_id)
             except Exception as exc:
-                logger.warning("[extract] worker pool failed (%s), falling back to thread executor", exc)
+                last_exc = exc
+                is_bot = _is_bot_error(exc)
+                is_conn = _is_conn_error(exc)
+                if not (is_bot or is_conn):
+                    break
+                if is_bot:
+                    exit_manager.note_bot_block()
+                else:
+                    exit_manager.note_conn_fail()
+                if attempt >= _BOT_MAX_ROTATIONS:
+                    break
+                if not exit_manager.should_rotate_now():
+                    logger.info("[extract] exit pool flagged (breaker tripped) — skipping rotation, failing fast for %s", video_id)
+                    break
+                logger.info("[extract] %s for %s (attempt %d/%d) — rotating exit",
+                            "bot/IP block" if is_bot else "connection/SOCKS failure",
+                            video_id, attempt + 1, _BOT_MAX_ROTATIONS)
+                result = await exit_manager.rotate("ytdlp")
+                if not result.get("changed") and not result.get("skipped"):
+                    # Rotation couldn't get us a different IP — no point retrying.
+                    logger.warning("[extract] exit rotation did not change IP for %s; giving up", video_id)
+                    break
 
-        # Fallback: run in the thread pool (used before pool is ready or on pool error).
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, _extract, video_id)
-        _store_info(video_id, info)
+        _mark_extraction_failed(video_id)
+        _record_ytdlp(False, str(last_exc) if last_exc else "")
+        assert last_exc is not None
+        raise last_exc
 
-    return _build_format_list(video_id)
+
+def _search_sync(query: str, limit: int) -> list[dict]:
+    """Flat YouTube search via yt-dlp (no per-video extraction, no PO token)."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": True,
+        **_cookie_opts(),
+        **_proxy_opts(),
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+    return (info or {}).get("entries", []) or []
+
+
+async def search_youtube(query: str, limit: int = 20) -> list[dict]:
+    """Search fallback for when Invidious is down — returns Invidious-shaped video dicts."""
+    loop = asyncio.get_event_loop()
+    entries = await loop.run_in_executor(None, _search_sync, query, limit)
+    out: list[dict] = []
+    for e in entries:
+        vid = (e or {}).get("id")
+        if not vid:
+            continue
+        out.append({
+            "type": "video",
+            "videoId": vid,
+            "title": e.get("title") or "",
+            "author": e.get("channel") or e.get("uploader") or "",
+            "authorId": e.get("channel_id") or e.get("uploader_id") or "",
+            "lengthSeconds": int(e.get("duration") or 0),
+            "viewCount": e.get("view_count") or 0,
+            "videoThumbnails": [
+                {"quality": "high", "url": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg", "width": 480, "height": 360},
+                {"quality": "medium", "url": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg", "width": 320, "height": 180},
+            ],
+            "published": 0,
+            "publishedText": "",
+            "description": e.get("description") or "",
+        })
+    return out
 
 
 def _store_info(video_id: str, info: dict):
@@ -325,15 +474,23 @@ def get_raw_info(video_id: str) -> Optional[dict]:
 
 def get_status(video_id: str) -> dict:
     """Non-blocking status check."""
+    if not _cache_fresh(video_id) and exit_manager.is_rotating():
+        return {"ready": False, "can_mux": False, "has_combined": False,
+                "status": "rotating", "message": "Switching network route…"}
     ready = _cache_fresh(video_id)
     if not ready:
-        return {"ready": False, "can_mux": False, "has_combined": False}
+        failed = _extraction_failed_recently(video_id)
+        return {"ready": False, "can_mux": False, "has_combined": False,
+                "status": "failed" if failed else "extracting",
+                "message": "Unavailable" if failed else "Fetching video…"}
     v, a, _, _ = get_mux_urls(video_id)
     combined = _get_best_combined(video_id)
     return {
         "ready": True,
         "can_mux": bool(v and a),
         "has_combined": bool(combined),
+        "status": "ready",
+        "message": "Stream ready",
     }
 
 
@@ -458,6 +615,35 @@ def _find_downloaded_file(video_id: str) -> Optional[str]:
     return None
 
 
+def _verify_download_integrity(path: str) -> bool:
+    """Return True if ffprobe reports a valid audio (or video) stream with duration > 10s.
+
+    Catches files that were silently truncated mid-download — yt-dlp can write
+    a partial file without raising an error when a DASH fragment retries exhausted.
+    Returns True on ffprobe errors so a missing binary never blocks playback.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        line = result.stdout.strip()
+        if not line:
+            return True  # no duration field — treat as OK to avoid false positives
+        duration = float(line)
+        if duration < 10:
+            logger.warning("[download] integrity: %s reports duration %.1fs — likely truncated", path, duration)
+            return False
+        return True
+    except (ValueError, subprocess.TimeoutExpired, FileNotFoundError):
+        return True
+
+
 def _do_download(video_id: str, mode: str):
     """Blocking yt-dlp download — runs in a thread pool executor."""
     state = _download_state[video_id]
@@ -487,6 +673,11 @@ def _do_download(video_id: str, mode: str):
         "outtmpl": os.path.join(DOWNLOAD_DIR, f"{video_id}.%(ext)s"),
         "progress_hooks": [progress_hook],
         "js_runtimes": {"node": {}},
+        "fragment_retries": 15,
+        "retries": 5,
+        "skip_unavailable_fragments": False,
+        **_cookie_opts(),
+        **_proxy_opts(),
     }
     if mode == "audio":
         ydl_opts["format"] = "bestaudio/best"
@@ -579,6 +770,9 @@ async def _download_task(video_id: str, mode: str):
             return
         path = _find_downloaded_file(video_id)
         if path:
+            if not _verify_download_integrity(path):
+                os.remove(path)
+                raise RuntimeError(f"Integrity check failed — audio likely truncated in {os.path.basename(path)}")
             _download_state[video_id] = {"status": "done", "progress": 100, "path": path, "mode": mode, "eta": None, "phase": "done"}
             logger.info(f"[download] {video_id} complete → {path}")
             enforce_disk_quota()

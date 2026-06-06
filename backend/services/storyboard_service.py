@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from typing import Optional
 
 logger = logging.getLogger("storyboard")
@@ -34,6 +35,24 @@ _SEGMENTS = 5  # parallel ffmpeg processes
 
 # Track in-progress generations so parallel requests don't double-generate
 _in_progress: dict[str, asyncio.Event] = {}
+
+# Negative cache: videos that failed (unavailable, age-restricted, etc.)
+_failed_videos: dict[str, float] = {}
+_FAIL_TTL = 600.0  # 10 minutes — don't retry a failed video within this window
+
+
+def _is_failed(video_id: str) -> bool:
+    ts = _failed_videos.get(video_id)
+    if ts is None:
+        return False
+    if time.time() - ts < _FAIL_TTL:
+        return True
+    del _failed_videos[video_id]
+    return False
+
+
+def _mark_failed(video_id: str) -> None:
+    _failed_videos[video_id] = time.time()
 
 
 def _sprite_path(video_id: str) -> str:
@@ -128,7 +147,7 @@ async def _ensure_black_frame(path: str) -> None:
 
 
 async def _do_generate(video_id: str) -> Optional[dict]:
-    from services import ytdlp_service
+    from backend.services import ytdlp_service
 
     raw_info = ytdlp_service.get_raw_info(video_id)
     if not raw_info:
@@ -178,7 +197,7 @@ async def _do_generate(video_id: str) -> Optional[dict]:
     os.makedirs(frame_dir, exist_ok=True)
 
     try:
-        from services import lq_service
+        from backend.services import lq_service
         lq_path = lq_service.get_lq_path(video_id)
         if not lq_path:
             lq_event = lq_service.get_lq_event(video_id)
@@ -348,15 +367,20 @@ async def generate_bg(video_id: str) -> None:
     """Start generation in the background; idempotent if already cached/running."""
     if get_cached(video_id):
         return
+    if _is_failed(video_id):
+        return
     if video_id in _in_progress:
         return
 
     event = asyncio.Event()
     _in_progress[video_id] = event
     try:
-        await _do_generate(video_id)
+        result = await _do_generate(video_id)
+        if result is None:
+            _mark_failed(video_id)
     except Exception as exc:
         logger.warning("[storyboard] generate_bg error for %s: %s", video_id, exc)
+        _mark_failed(video_id)
     finally:
         _in_progress.pop(video_id, None)
         event.set()
@@ -367,6 +391,9 @@ async def get_or_wait(video_id: str, wait_secs: float = 8.0) -> Optional[dict]:
     cached = get_cached(video_id)
     if cached:
         return cached
+
+    if _is_failed(video_id):
+        return None
 
     if video_id in _in_progress:
         event = _in_progress[video_id]
@@ -381,9 +408,12 @@ async def get_or_wait(video_id: str, wait_secs: float = 8.0) -> Optional[dict]:
     _in_progress[video_id] = event
     try:
         result = await _do_generate(video_id)
+        if result is None:
+            _mark_failed(video_id)
         return result
     except Exception as exc:
         logger.warning("[storyboard] get_or_wait error for %s: %s", video_id, exc)
+        _mark_failed(video_id)
         return None
     finally:
         _in_progress.pop(video_id, None)

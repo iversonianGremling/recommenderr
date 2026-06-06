@@ -29,3 +29,12 @@ async def enqueue_crawl(req: EnqueueRequest) -> dict:
         return {"ok": True, "video_id": req.video_id}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/populate")
+async def populate_crawl_queue() -> dict:
+    """Scan history/playlists and add uncrawled videos to the queue."""
+    from backend.services.crawler import populate_queue
+    from starlette.concurrency import run_in_threadpool
+    added = await run_in_threadpool(populate_queue)
+    return {"ok": True, "added": added if isinstance(added, int) else None}

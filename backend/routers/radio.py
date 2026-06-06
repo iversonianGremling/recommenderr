@@ -1,13 +1,12 @@
 """Radio endpoint — seed tracks → ranked music-confirmed YouTube stream."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from pydantic import BaseModel
 
-from backend.auth import require_service_token
 from backend.services.radio_service import generate_radio
 
-router = APIRouter(dependencies=[Depends(require_service_token)])
+router = APIRouter()
 
 
 class RadioSeed(BaseModel):

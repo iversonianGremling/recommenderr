@@ -7,3 +7,7 @@ __pycache__/
 admin-ui/node_modules/
 admin-ui/dist/
 admin-ui/tsconfig.tsbuildinfo
+
+# Editor / ad-hoc backups
+*.bak
+*.bak-*

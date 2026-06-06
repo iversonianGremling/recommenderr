@@ -1,25 +1,28 @@
 import { useEffect, useState } from 'react'
 import { listFeedFilters, addFeedFilter, deleteFeedFilter } from '../lib/api'
+import GraphSelector from '../components/GraphSelector'
 import type { FeedFilter } from '../lib/types'
 
 const FILTER_TYPES = ['channel_id', 'channel_name', 'keyword', 'video_id']
 
-export default function RecommendationFilters() {
+export default function RecommendationFilters({ graphId: initGraphId }: { graphId?: number } = {}) {
+  const [graphId, setGraphId] = useState(initGraphId ?? 0)
   const [filters, setFilters] = useState<FeedFilter[]>([])
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [form, setForm] = useState({ filter_type: 'channel_id', match_value: '' })
   const [submitting, setSubmitting] = useState(false)
 
-  const load = () => {
+  const load = (gid: number) => {
+    if (!gid) return
     setLoading(true)
-    listFeedFilters()
+    listFeedFilters(gid)
       .then(setFilters)
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false))
   }
 
-  useEffect(load, [])
+  useEffect(() => { load(graphId) }, [graphId])
 
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -30,9 +33,9 @@ export default function RecommendationFilters() {
     setSubmitting(true)
     setError(null)
     try {
-      await addFeedFilter({ filter_type: form.filter_type, match_value: form.match_value.trim() })
+      await addFeedFilter({ filter_type: form.filter_type, match_value: form.match_value.trim(), graph_id: graphId })
       setForm((f) => ({ ...f, match_value: '' }))
-      load()
+      load(graphId)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -42,7 +45,7 @@ export default function RecommendationFilters() {
 
   const handleDelete = async (id: number) => {
     try {
-      await deleteFeedFilter(id)
+      await deleteFeedFilter(id, graphId)
       setFilters((f) => f.filter((x) => x.id !== id))
     } catch (e) {
       setError(String(e))
@@ -51,9 +54,12 @@ export default function RecommendationFilters() {
 
   return (
     <div className="max-w-2xl">
-      <h1 className="page-title mb-4">Feed Filters</h1>
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="page-title">Feed Filters</h1>
+        <GraphSelector value={graphId} onChange={setGraphId} />
+      </div>
       <p className="text-xs text-text-2 mb-4">
-        Permanently block channels, keywords, or individual videos from the feed. Invalidates feed cache on change.
+        Permanently block channels, keywords, or individual videos from the feed for this graph. Invalidates feed cache on change.
       </p>
 
       <form onSubmit={handleAdd} className="mb-5 flex flex-wrap gap-2 items-end">
@@ -76,7 +82,7 @@ export default function RecommendationFilters() {
             onChange={(e) => setForm((f) => ({ ...f, match_value: e.target.value }))}
           />
         </div>
-        <button className="btn-primary" type="submit" disabled={submitting}>Block</button>
+        <button className="btn-primary" type="submit" disabled={submitting || !graphId}>Block</button>
       </form>
 
       {error && <p className="text-red-500 text-sm mb-3">{error}</p>}

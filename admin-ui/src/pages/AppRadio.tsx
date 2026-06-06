@@ -5,7 +5,7 @@ interface RadioTrack {
   title?: string
   author?: string
   thumbnail?: string
-  duration?: number
+  lengthSeconds?: number
 }
 
 interface RadioResult {
@@ -37,7 +37,7 @@ export default function AppRadio() {
     setSelected(null)
     setResult(null)
     try {
-      const r = await fetch(`/v1/ppr/track-search?q=${encodeURIComponent(query)}`).then((r) => r.json()) as Array<{ track: string; artist: string }>
+      const r = await fetch(`/v1/radio/search?q=${encodeURIComponent(query)}`).then((r) => r.json()) as Array<{ track: string; artist: string }>
       setSuggestions(r)
     } catch (e) {
       setError(String(e))
@@ -55,7 +55,7 @@ export default function AppRadio() {
       const r = await fetch('/v1/radio', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ track, artist, limit: 20 }),
+        body: JSON.stringify({ seeds: [{ track, artist }], limit: 20 }),
       }).then((r) => r.json()) as RadioResult
       setResult(r)
     } catch (e) {
@@ -134,7 +134,7 @@ export default function AppRadio() {
                       </div>
                     </div>
                   </td>
-                  <td className="td text-right font-mono text-text-2"><Duration secs={t.duration} /></td>
+                  <td className="td text-right font-mono text-text-2"><Duration secs={t.lengthSeconds} /></td>
                   <td className="td text-right">
                     <a
                       href={`/watch?v=${t.video_id}`}

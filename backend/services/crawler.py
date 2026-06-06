@@ -2,8 +2,9 @@ import asyncio
 import random
 import time
 import logging
-from backend.db import get_db, save_recommendations
+from backend.db import get_db, save_recommendations, get_graph_ids_for_source
 from backend.services.invidious_client import api_get
+from backend.services import exit_manager
 
 logger = logging.getLogger("crawler")
 
@@ -221,12 +222,23 @@ async def crawl_worker():
                 await asyncio.sleep(30)
                 continue
 
+            # Yield to user-driven playback: pause bulk crawling while an
+            # interactive fetch is in flight so it can't poison the exit IP
+            # reputation interactive playback depends on.
+            if exit_manager.interactive_active():
+                logger.debug("Crawler pausing — interactive request in flight")
+                await exit_manager.wait_until_idle()
+
             retry_count = video.get("retry_count", 0)
             try:
                 data = await api_get(f"/videos/{video['video_id']}", timeout=60.0)
                 recs = data.get("recommendedVideos", [])
                 title = video.get("title") or data.get("title", "")
-                save_recommendations(video["video_id"], title, recs, max_save=10)
+                graph_ids = get_graph_ids_for_source("invidious") or [1]
+                from backend.services.mapping_executor import get_mapping_for_source, apply_mapping
+                mapping_code = get_mapping_for_source("invidious")
+                mapped_recs = [apply_mapping(r, mapping_code) for r in recs]
+                save_recommendations(video["video_id"], title, mapped_recs, max_save=10, graph_ids=graph_ids)
                 _store_metadata(video["video_id"], data)
                 mark_done(video["video_id"])
                 logger.debug("Crawled %s (%d recs)", video["video_id"], len(recs))

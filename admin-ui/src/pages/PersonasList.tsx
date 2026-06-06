@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { listPersonas, createPersona, deletePersona, recomputePersona } from '../lib/api'
+import { listPersonas, createPersona, deletePersona, recomputePersona, autoGeneratePersonas } from '../lib/api'
 import type { Persona } from '../lib/types'
 
 function statusDot(status: Persona['job_status']) {
@@ -15,6 +15,8 @@ export default function PersonasList() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
+  const [autoGenerating, setAutoGenerating] = useState(false)
+  const [autoResult, setAutoResult] = useState<string | null>(null)
   const [newName, setNewName] = useState('')
   const navigate = useNavigate()
 
@@ -60,14 +62,42 @@ export default function PersonasList() {
     load()
   }
 
+  const handleAutoGenerate = async () => {
+    setAutoGenerating(true)
+    setAutoResult(null)
+    setError(null)
+    try {
+      const res = await autoGeneratePersonas({ top_keywords: 20, min_videos_per_keyword: 3 })
+      setAutoResult(`Created ${res.total_created} personas: ${res.created.join(', ') || 'none'} · Skipped: ${res.skipped.length}`)
+      load()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setAutoGenerating(false)
+    }
+  }
+
   return (
     <div className="max-w-3xl">
       <div className="flex items-center justify-between mb-4">
         <h1 className="page-title">Personas</h1>
+        <button
+          className="btn text-xs py-1 px-3"
+          onClick={handleAutoGenerate}
+          disabled={autoGenerating}
+          title="Generate personas from top video keywords"
+        >
+          {autoGenerating ? 'Generating…' : '⚡ Auto-generate from keywords'}
+        </button>
       </div>
       <p className="text-xs text-text-2 mb-4">
         Personas are named seed bundles. Each runs its own PPR pass and produces a ranked list of recommendations tuned to that interest profile.
+        Auto-generate creates one persona per top keyword using your watched/rated videos as seeds.
       </p>
+
+      {autoResult && (
+        <p className="text-xs text-green-400 mb-3 rounded bg-green-400/10 border border-green-400/20 px-3 py-2">{autoResult}</p>
+      )}
 
       <form onSubmit={handleCreate} className="mb-6 flex gap-2">
         <input

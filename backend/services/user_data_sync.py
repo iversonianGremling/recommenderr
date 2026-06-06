@@ -1,4 +1,4 @@
-"""Sync user-data (watch history, playlist videos) from ytvideo into the local cache tables.
+"""Sync user-data (watch history, playlist videos) from configured signal sources.
 
 Called before PPR feed computations so the ppr_engine has up-to-date data
 without needing a direct DB connection to ytvideo.
@@ -6,7 +6,6 @@ without needing a direct DB connection to ytvideo.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 import httpx
@@ -15,16 +14,99 @@ from backend.db import get_db
 
 logger = logging.getLogger("user_data_sync")
 
-YTVIDEO_URL = os.environ.get("YTVIDEO_URL", "http://127.0.0.1:9002")
-RECOMMENDERR_TOKEN = os.environ.get("RECOMMENDERR_TOKEN", "")
-_SYNC_TTL = 30.0  # seconds between syncs
+_SYNC_TTL = 30.0
 _last_sync: float = 0.0
 
 
-def _headers() -> dict[str, str]:
-    if RECOMMENDERR_TOKEN:
-        return {"Authorization": f"Bearer {RECOMMENDERR_TOKEN}"}
-    return {}
+def _upsert_watch_history(rows: list[dict]) -> int:
+    conn = get_db()
+    try:
+        conn.executemany(
+            """INSERT INTO watch_history (video_id, title, author_id, watched_at)
+               VALUES (:video_id, :title, :author_id, :watched_at)
+               ON CONFLICT(video_id) DO UPDATE SET
+                   title=excluded.title,
+                   author_id=excluded.author_id,
+                   watched_at=excluded.watched_at""",
+            rows,
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def _upsert_playlist_videos(rows: list[dict]) -> int:
+    conn = get_db()
+    try:
+        conn.executemany(
+            """INSERT INTO playlist_videos (playlist_id, video_id, title, author_id)
+               VALUES (:playlist_id, :video_id, :title, :author_id)
+               ON CONFLICT(playlist_id, video_id) DO UPDATE SET
+                   title=excluded.title,
+                   author_id=excluded.author_id""",
+            rows,
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def _update_source_result(source_id: int, count: int | None, error: str | None) -> None:
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE signal_sources SET last_synced_at=?, last_count=?, last_error=? WHERE id=?",
+            (time.time(), count, error, source_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def sync_source(source: dict) -> dict:
+    """Fetch + upsert data for one signal source. Returns {ok, count} or {ok, error}."""
+    headers: dict[str, str] = {}
+    if source.get("auth_header"):
+        headers["Authorization"] = source["auth_header"]
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=source["endpoint_url"],
+            timeout=httpx.Timeout(10.0, connect=2.0),
+        ) as client:
+            converter = source.get("converter", "ytfront_v1")
+
+            if converter == "ytfront_v1":
+                resp = await client.get("/internal/history", headers=headers)
+                resp.raise_for_status()
+                count = _upsert_watch_history(resp.json())
+
+            elif converter == "ytfront_likes_v1":
+                resp = await client.get("/internal/playlists/videos", headers=headers)
+                resp.raise_for_status()
+                count = _upsert_playlist_videos(resp.json())
+
+            else:  # native: expects {watch_history: [...], playlist_videos: [...]}
+                resp = await client.get("/api/signals", headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                count = 0
+                if "watch_history" in data:
+                    count += _upsert_watch_history(data["watch_history"])
+                if "playlist_videos" in data:
+                    count += _upsert_playlist_videos(data["playlist_videos"])
+
+        _update_source_result(source["id"], count, None)
+        logger.debug("sync_source %s: %d rows", source["name"], count)
+        return {"ok": True, "count": count}
+
+    except Exception as exc:
+        msg = str(exc)
+        _update_source_result(source["id"], None, msg)
+        logger.debug("sync_source %s: error — %s", source["name"], msg)
+        return {"ok": False, "error": msg}
 
 
 async def sync_user_data_cache() -> None:
@@ -34,44 +116,20 @@ async def sync_user_data_cache() -> None:
         return
     _last_sync = now
 
-    try:
-        async with httpx.AsyncClient(base_url=YTVIDEO_URL, timeout=httpx.Timeout(5.0, connect=1.0)) as client:
-            history_resp = await client.get("/internal/history", headers=_headers())
-            history_resp.raise_for_status()
-            history_rows: list[dict] = history_resp.json()
-
-            pv_resp = await client.get("/internal/playlists/videos", headers=_headers())
-            pv_resp.raise_for_status()
-            pv_rows: list[dict] = pv_resp.json()
-    except Exception as exc:
-        logger.debug("user_data_sync: could not reach ytvideo (%s) — using local cache", exc)
-        return
-
     conn = get_db()
     try:
-        conn.executemany(
-            """
-            INSERT INTO watch_history (video_id, title, author_id, watched_at)
-            VALUES (:video_id, :title, :author_id, :watched_at)
-            ON CONFLICT(video_id) DO UPDATE SET
-                title=excluded.title,
-                author_id=excluded.author_id,
-                watched_at=excluded.watched_at
-            """,
-            history_rows,
-        )
-        conn.executemany(
-            """
-            INSERT INTO playlist_videos (playlist_id, video_id, title, author_id)
-            VALUES (:playlist_id, :video_id, :title, :author_id)
-            ON CONFLICT(playlist_id, video_id) DO UPDATE SET
-                title=excluded.title,
-                author_id=excluded.author_id
-            """,
-            pv_rows,
-        )
-        conn.commit()
-    except Exception as exc:
-        logger.warning("user_data_sync: DB upsert failed: %s", exc)
+        rows = conn.execute(
+            "SELECT * FROM signal_sources WHERE enabled=1"
+        ).fetchall()
+        sources = [dict(r) for r in rows]
+    except Exception:
+        # Table may not exist yet on first-boot before migration runs
+        sources = []
     finally:
         conn.close()
+
+    for source in sources:
+        try:
+            await sync_source(source)
+        except Exception as exc:
+            logger.warning("sync_user_data_cache: source %s failed: %s", source.get("name"), exc)

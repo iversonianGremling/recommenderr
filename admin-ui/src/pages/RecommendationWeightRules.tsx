@@ -1,25 +1,28 @@
 import { useEffect, useState } from 'react'
 import { listWeightRules, addWeightRule, deleteWeightRule } from '../lib/api'
+import GraphSelector from '../components/GraphSelector'
 import type { WeightRule } from '../lib/types'
 
 const RULE_TYPES = ['keyword', 'channel_id', 'channel_name', 'genre', 'category', 'attribute']
 
-export default function RecommendationWeightRules() {
+export default function RecommendationWeightRules({ graphId: initGraphId }: { graphId?: number } = {}) {
+  const [graphId, setGraphId] = useState(initGraphId ?? 0)
   const [rules, setRules] = useState<WeightRule[]>([])
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [form, setForm] = useState({ rule_type: 'keyword', match_value: '', multiplier: '2' })
   const [submitting, setSubmitting] = useState(false)
 
-  const load = () => {
+  const load = (gid: number) => {
+    if (!gid) return
     setLoading(true)
-    listWeightRules()
+    listWeightRules(gid)
       .then(setRules)
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false))
   }
 
-  useEffect(load, [])
+  useEffect(() => { load(graphId) }, [graphId])
 
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -31,9 +34,9 @@ export default function RecommendationWeightRules() {
     setSubmitting(true)
     setError(null)
     try {
-      await addWeightRule({ rule_type: form.rule_type, match_value: form.match_value.trim(), multiplier: mult })
+      await addWeightRule({ rule_type: form.rule_type, match_value: form.match_value.trim(), multiplier: mult, graph_id: graphId })
       setForm((f) => ({ ...f, match_value: '' }))
-      load()
+      load(graphId)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -43,7 +46,7 @@ export default function RecommendationWeightRules() {
 
   const handleDelete = async (id: number) => {
     try {
-      await deleteWeightRule(id)
+      await deleteWeightRule(id, graphId)
       setRules((r) => r.filter((x) => x.id !== id))
     } catch (e) {
       setError(String(e))
@@ -52,9 +55,12 @@ export default function RecommendationWeightRules() {
 
   return (
     <div className="max-w-2xl">
-      <h1 className="page-title mb-4">Weight Rules</h1>
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="page-title">Weight Rules</h1>
+        <GraphSelector value={graphId} onChange={setGraphId} />
+      </div>
       <p className="text-xs text-text-2 mb-4">
-        Boost or suppress recommendations by keyword, channel, genre, category, or attribute. Multiplier &gt; 1 boosts, &lt; 1 suppresses. Invalidates feed cache on change.
+        Boost or suppress recommendations by keyword, channel, genre, category, or attribute for this graph. Multiplier &gt; 1 boosts, &lt; 1 suppresses. Invalidates feed cache on change.
       </p>
 
       <form onSubmit={handleAdd} className="mb-5 flex flex-wrap gap-2 items-end">
@@ -88,7 +94,7 @@ export default function RecommendationWeightRules() {
             onChange={(e) => setForm((f) => ({ ...f, multiplier: e.target.value }))}
           />
         </div>
-        <button className="btn-primary" type="submit" disabled={submitting}>Add</button>
+        <button className="btn-primary" type="submit" disabled={submitting || !graphId}>Add</button>
       </form>
 
       {error && <p className="text-red-500 text-sm mb-3">{error}</p>}

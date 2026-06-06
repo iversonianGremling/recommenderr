@@ -4,7 +4,7 @@ def test_health_returns_ok(client):
     body = r.json()
     assert body["service"] == "recommenderr"
     assert body["status"] == "ok"
-    assert body["schema_version"] == 1
+    assert body["schema_version"] == 8
 
 
 def test_schema_applied(tmp_db):

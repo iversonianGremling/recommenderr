@@ -46,7 +46,7 @@ def get_status(video_id: str) -> dict:
 
 
 async def _do_download(video_id: str) -> Optional[str]:
-    from services import ytdlp_service
+    from backend.services import ytdlp_service
 
     raw_info = ytdlp_service.get_raw_info(video_id)
     if not raw_info:
@@ -128,6 +128,8 @@ async def _do_download(video_id: str) -> Optional[str]:
 async def download_bg(video_id: str) -> None:
     """Start download in background; idempotent."""
     if get_lq_path(video_id):
+        return
+    if _status.get(video_id) == "failed":
         return
     if video_id in _in_progress:
         return

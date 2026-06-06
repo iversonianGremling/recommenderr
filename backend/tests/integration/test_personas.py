@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture(autouse=True)
 def _skip_cache_warm():
     from backend.services import feed_cache
-    feed_cache._snapshot.computed_at = 0.0
+    feed_cache._snapshots.clear()
     yield
 
 
