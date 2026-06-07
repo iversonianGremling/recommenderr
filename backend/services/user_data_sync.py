@@ -16,6 +16,9 @@ logger = logging.getLogger("user_data_sync")
 
 _SYNC_TTL = 30.0
 _last_sync: float = 0.0
+# Signature of the last category snapshot we mirrored, so we skip the (lock-heavy)
+# full-table rewrite on the common case where nothing changed between syncs.
+_last_category_sig: str | None = None
 
 
 def _upsert_watch_history(rows: list[dict]) -> int:
@@ -53,6 +56,87 @@ def _upsert_playlist_videos(rows: list[dict]) -> int:
         conn.close()
 
 
+def _category_membership(conn) -> dict[int, set]:
+    """category_id -> set of member keys (videos / channels / tags), for change
+    detection so we only recompute recs for categories that actually changed."""
+    membership: dict[int, set] = {}
+    for tbl, col in (
+        ("video_category_assignments", "video_id"),
+        ("channel_category_assignments", "channel_id"),
+        ("category_tags", "tag_id"),
+    ):
+        for r in conn.execute(f"SELECT category_id, {col} AS k FROM {tbl}").fetchall():
+            membership.setdefault(r["category_id"], set()).add((tbl, r["k"]))
+    return membership
+
+
+def _sync_categories_data(snapshot: dict) -> int:
+    """Mirror ytvideo's category snapshot into recommenderr (IDs preserved) so the
+    category_recs worker has data to compute against. Marks changed categories dirty."""
+    global _last_category_sig
+    import hashlib
+    import json
+    from backend.services import category_recs
+
+    # Skip the lock-heavy rewrite when the snapshot is byte-identical to last time.
+    sig = hashlib.md5(
+        json.dumps(snapshot, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    if sig == _last_category_sig:
+        return len(snapshot.get("categories", []) or [])
+
+    cats = snapshot.get("categories", []) or []
+    tags = snapshot.get("tags", []) or []
+    va = snapshot.get("video_assignments", []) or []
+    ca = snapshot.get("channel_assignments", []) or []
+    ct = snapshot.get("category_tags", []) or []
+    vt = snapshot.get("video_tags", []) or []
+    now = time.time()
+
+    conn = get_db()
+    try:
+        before = _category_membership(conn)
+
+        # Replace categories + tags, preserving ytvideo's IDs so assignment FKs and
+        # cached recommendations (keyed by category_id) stay valid.
+        conn.execute("DELETE FROM categories")
+        conn.executemany(
+            "INSERT INTO categories (id, name, parent_id, description, created_at) VALUES (?,?,?,?,?)",
+            [(c["id"], c["name"], c.get("parent_id"), c.get("description") or "", now) for c in cats],
+        )
+        conn.execute("DELETE FROM tags")
+        conn.executemany(
+            "INSERT INTO tags (id, name, description, created_at) VALUES (?,?,?,?)",
+            [(t["id"], t["name"], "", now) for t in tags],
+        )
+
+        # Replace assignment tables wholesale (snapshot is authoritative).
+        for tbl, rows, cols in (
+            ("video_category_assignments", va, ("video_id", "category_id")),
+            ("channel_category_assignments", ca, ("channel_id", "category_id")),
+            ("category_tags", ct, ("category_id", "tag_id")),
+            ("video_tags", vt, ("video_id", "tag_id")),
+        ):
+            conn.execute(f"DELETE FROM {tbl}")
+            conn.executemany(
+                f"INSERT OR IGNORE INTO {tbl} ({cols[0]}, {cols[1]}) VALUES (?,?)",
+                [(r[cols[0]], r[cols[1]]) for r in rows],
+            )
+        conn.commit()
+
+        after = _category_membership(conn)
+    finally:
+        conn.close()
+
+    changed = {cid for cid in (set(before) | set(after)) if before.get(cid) != after.get(cid)}
+    for cid in changed:
+        category_recs.mark_dirty(cid)
+    if changed:
+        logger.debug("category sync: %d categories changed → marked dirty", len(changed))
+    _last_category_sig = sig
+    return len(cats)
+
+
 def _update_source_result(source_id: int, count: int | None, error: str | None) -> None:
     conn = get_db()
     try:
@@ -82,6 +166,14 @@ async def sync_source(source: dict) -> dict:
                 resp = await client.get("/internal/history", headers=headers)
                 resp.raise_for_status()
                 count = _upsert_watch_history(resp.json())
+                # Category definitions/assignments ride along the same ytvideo
+                # source so the category_recs worker has fresh data to rank.
+                try:
+                    cresp = await client.get("/internal/categories", headers=headers)
+                    cresp.raise_for_status()
+                    _sync_categories_data(cresp.json())
+                except Exception as exc:
+                    logger.warning("category sync failed for %s: %s", source.get("name"), exc)
 
             elif converter == "ytfront_likes_v1":
                 resp = await client.get("/internal/playlists/videos", headers=headers)

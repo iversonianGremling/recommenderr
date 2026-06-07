@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import sqlite3
 import time
 from collections import defaultdict
 
@@ -346,6 +348,58 @@ def _persist(album_recs, artist_recs, song_recs) -> None:
         conn.close()
 
 
+def sync_app_rating_seeds(min_rating: int = 7) -> dict:
+    """Mirror the app's *own* album ratings into external_music_seeds.
+
+    The recommended-music engine seeds from external_music_seeds. yamtrack pushes
+    its highly-rated items there directly, but the user also has native app
+    ratings (set in the UI, or imported from RateYourMusic/iTunes/…) living in
+    ytmusic's album_ratings table. This pulls every album rated >= min_rating —
+    regardless of source — into external_music_seeds as source='app_ratings', so
+    the user's whole rating history drives recommendations, not just yamtrack.
+
+    Read-only on ytmusic.db. Seeds dedupe by artist/album key downstream (the
+    engine takes max weight per key), so overlap with the 'yamtrack' source is
+    harmless. Returns {ok, ingested}.
+    """
+    ytdb = os.getenv("YTMUSIC_DB_PATH", "/opt/ytmusic/data/ytmusic.db")
+    try:
+        yc = sqlite3.connect(f"file:{ytdb}?mode=ro", uri=True, timeout=10)
+        yc.row_factory = sqlite3.Row
+        try:
+            rated = yc.execute(
+                "SELECT album_title, album_artist, rating FROM album_ratings WHERE rating >= ?",
+                (min_rating,),
+            ).fetchall()
+        finally:
+            yc.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sync_app_rating_seeds: cannot read ytmusic ratings (%s): %s", ytdb, exc)
+        return {"ok": False, "error": str(exc), "ingested": 0}
+
+    now = time.time()
+    seeds = [
+        ("app_ratings", "album", (r["album_artist"] or "").strip(),
+         (r["album_title"] or "").strip(), "", float(r["rating"]), now)
+        for r in rated if (r["album_title"] or "").strip()
+    ]
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM external_music_seeds WHERE source = 'app_ratings'")
+        if seeds:
+            conn.executemany(
+                """INSERT OR REPLACE INTO external_music_seeds
+                   (source, kind, artist, album, track, score, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                seeds,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info("sync_app_rating_seeds: ingested %d app-rating album seeds", len(seeds))
+    return {"ok": True, "ingested": len(seeds)}
+
+
 async def recompute() -> dict:
     """Run a full recompute (idempotent; guarded against concurrent runs)."""
     if _state["running"]:
@@ -353,6 +407,12 @@ async def recompute() -> dict:
     _state["running"] = True
     _state["last_error"] = None
     try:
+        # Refresh app-rating seeds (yamtrack + RYM + manual) before computing so
+        # the user's whole rating history is reflected, then run the PPR.
+        try:
+            sync_app_rating_seeds()
+        except Exception:  # noqa: BLE001
+            logger.exception("sync_app_rating_seeds failed (continuing with existing seeds)")
         result = await _compute()
         _state["last_computed"] = time.time()
         return {"status": "ok", **result}

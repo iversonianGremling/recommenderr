@@ -1,10 +1,17 @@
-"""Radio endpoint — seed tracks → ranked music-confirmed YouTube stream."""
+"""Radio endpoint — seed (track / artist / video_id) → ranked in-library stream.
+
+Backed by `radio_library.build_radio`, which ranks the user's own music library
+by similarity to the seeds (no external YouTube resolution), so radio works even
+while egress is rate-limited/blocked. Response stays on the RadioTrack contract
+the ytmusic frontend already consumes (`useRadioAutoExtend`, Start-radio menus).
+"""
 from __future__ import annotations
 
 from fastapi import APIRouter
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from backend.services.radio_service import generate_radio
+from backend.services.radio_library import build_radio
 
 router = APIRouter()
 
@@ -18,29 +25,27 @@ class RadioSeed(BaseModel):
 class RadioRequest(BaseModel):
     seeds: list[RadioSeed]
     limit: int = 30
-    hops: int = 1
+    hops: int = 1  # accepted for backwards-compat; in-library radio ignores it
     exclude_video_ids: list[str] = []
 
 
 @router.post("")
 async def radio(req: RadioRequest) -> dict:
-    seed_pairs: list[tuple[str, str]] = []
-    for s in req.seeds:
-        t = (s.track or "").strip()
-        a = (s.artist or "").strip()
-        if t or a:
-            seed_pairs.append((t, a))
-
-    if not seed_pairs:
+    seeds = [
+        {"video_id": s.video_id, "track": s.track, "artist": s.artist}
+        for s in req.seeds
+        if (s.video_id or s.track or s.artist)
+    ]
+    if not seeds:
         return {"tracks": [], "total": 0, "seeds": 0}
 
-    tracks = await generate_radio(
-        seed_pairs,
+    tracks = await run_in_threadpool(
+        build_radio,
+        seeds,
         limit=max(1, min(req.limit, 100)),
-        hops=max(1, min(req.hops, 2)),
         exclude_video_ids=set(req.exclude_video_ids),
     )
-    return {"tracks": tracks, "total": len(tracks), "seeds": len(seed_pairs)}
+    return {"tracks": tracks, "total": len(tracks), "seeds": len(seeds)}
 
 
 @router.get("/search")

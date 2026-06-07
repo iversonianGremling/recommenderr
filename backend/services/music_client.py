@@ -517,6 +517,64 @@ async def lastfm_search_track(track: str, artist: str = "", limit: int = 5) -> l
 
 
 @with_source("lastfm")
+async def lastfm_album_tags(artist: str, album: str) -> list[str]:
+    """Top tags for an album via album.getInfo — a rich mix of genres AND moods
+    (e.g. 'chillout', 'melancholy'). Used as classification candidates."""
+    key = get_credential("lastfm", "LASTFM_KEY")
+    if not key or not (artist or "").strip() or not (album or "").strip():
+        return []
+    try:
+        params = {
+            "method": "album.getinfo",
+            "artist": artist,
+            "album": album,
+            "api_key": key,
+            "autocorrect": 1,
+            "format": "json",
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get("https://ws.audioscrobbler.com/2.0/", params=params)
+            r.raise_for_status()
+            data = r.json()
+        tags = (data.get("album", {}) or {}).get("tags", {})
+        tag_list = tags.get("tag") if isinstance(tags, dict) else tags
+        if isinstance(tag_list, dict):
+            tag_list = [tag_list]
+        out = [str(t.get("name", "")).strip() for t in (tag_list or []) if isinstance(t, dict)]
+        return [t for t in out if t]
+    except Exception:
+        return []
+
+
+@with_source("lastfm")
+async def lastfm_artist_tags(artist: str, limit: int = 8) -> list[str]:
+    """Top tags for an artist via artist.getTopTags — genre fallback when album
+    tags are sparse."""
+    key = get_credential("lastfm", "LASTFM_KEY")
+    if not key or not (artist or "").strip():
+        return []
+    try:
+        params = {
+            "method": "artist.gettoptags",
+            "artist": artist,
+            "api_key": key,
+            "autocorrect": 1,
+            "format": "json",
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get("https://ws.audioscrobbler.com/2.0/", params=params)
+            r.raise_for_status()
+            data = r.json()
+        tag_list = (data.get("toptags", {}) or {}).get("tag", [])
+        if isinstance(tag_list, dict):
+            tag_list = [tag_list]
+        out = [str(t.get("name", "")).strip() for t in (tag_list or []) if isinstance(t, dict)]
+        return [t for t in out if t][:limit]
+    except Exception:
+        return []
+
+
+@with_source("lastfm")
 async def lastfm_get_similar_tracks(track: str, artist: str, limit: int = 10) -> list[dict]:
     key = get_credential("lastfm", "LASTFM_KEY")
     if not key:

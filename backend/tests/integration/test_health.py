@@ -4,7 +4,10 @@ def test_health_returns_ok(client):
     body = r.json()
     assert body["service"] == "recommenderr"
     assert body["status"] == "ok"
-    assert body["schema_version"] == 8
+    # Track the live constant rather than a hardcoded number so this doesn't
+    # rot every time a migration bumps the schema.
+    from backend.main import SCHEMA_VERSION
+    assert body["schema_version"] == SCHEMA_VERSION
 
 
 def test_schema_applied(tmp_db):

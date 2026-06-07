@@ -127,6 +127,26 @@ async def recompute_library_recommendations(wait: bool = Query(False)):
     return {"status": "started"}
 
 
+@router.post("/library/app-ratings/sync")
+def sync_app_rating_seeds_endpoint(min_rating: int = Query(7, ge=1, le=10)):
+    """Mirror the app's own album ratings (ytmusic.db — yamtrack, RYM, manual…)
+    into external_music_seeds as source='app_ratings'. No egress; just refreshes
+    the seed set so a subsequent recompute reflects the full rating history."""
+    return librec.sync_app_rating_seeds(min_rating=min_rating)
+
+
+@router.post("/library/favorites-tag/sync")
+def sync_favorites_tag_endpoint(
+    min_rating: int = Query(8, ge=1, le=10),
+    include_artist: bool = Query(True),
+):
+    """Project highly-rated favorites (album_ratings) onto a 'Favorites' music
+    tag by matching library tracks. Additive + idempotent; re-run after adding/
+    downloading rated albums so their tracks join the tag automatically."""
+    from backend.services.favorites_sync import sync_favorites_tag
+    return sync_favorites_tag(min_rating=min_rating, include_artist=include_artist)
+
+
 @router.get("/library/status")
 def get_library_status():
     """Live state of the yamtrack → catalog-PPR → library-recs lane, for the

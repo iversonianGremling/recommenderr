@@ -48,6 +48,9 @@ def get_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Wait (up to 5s) for a held lock instead of failing instantly with
+    # "database is locked" — matters under the recommendation workers' writes.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 

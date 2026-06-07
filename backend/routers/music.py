@@ -1,12 +1,17 @@
 import asyncio
+import html
+import json
 import logging
 import math
 import os
 import re
+import time
 from difflib import SequenceMatcher
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from backend.services import music_worker
@@ -33,6 +38,7 @@ from backend.services.bandcamp_recommendations import (
     get_shared_bandcamp_recommender,
 )
 from backend.services.invidious_client import api_get
+from backend.services import music_classifier
 from backend.services.music_client import (
     bandcamp_album_details,
     bandcamp_search_albums,
@@ -421,6 +427,58 @@ def _fallback_query(track: str, artist: str, title: str, author: str) -> str:
     return ""
 
 
+_ARTIST_TITLE_SPLIT_RE = re.compile(r"\s[-–—]\s")
+
+
+def _split_artist_title(title: str | None) -> tuple[str, str]:
+    """Parse the 'Artist - Track' YouTube title convention → (artist, track), else ('', '')."""
+    if not title:
+        return "", ""
+    parts = _ARTIST_TITLE_SPLIT_RE.split(title, maxsplit=1)
+    if len(parts) != 2:
+        return "", ""
+    artist = _clean_music_hint(parts[0])
+    track = _clean_music_hint(parts[1])
+    if not artist or not track:
+        return "", ""
+    return artist, track
+
+
+def _lyrics_candidates(
+    client_track: str, client_artist: str, client_album: str,
+    db_track: str, db_artist: str, db_album: str,
+    title: str, author: str,
+) -> list[tuple[str, str, str]]:
+    """Ordered, de-duped (track, artist, album) queries to try.
+
+    The player often passes the YouTube *uploader* as the artist (e.g. "Manny" for a
+    Jorge Ben track), so we never trust one source: client hint, the curated library
+    row, and the "Artist - Track" split of the title are all tried.
+    """
+    seen: set[tuple[str, str]] = set()
+    cands: list[tuple[str, str, str]] = []
+
+    def add(t: str, a: str, al: str) -> None:
+        t, a, al = (t or "").strip(), (a or "").strip(), (al or "").strip()
+        if not t:
+            return
+        key = (t.lower(), a.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        cands.append((t, a, al))
+
+    if client_track or client_artist:
+        add(client_track, client_artist, client_album)
+    add(db_track, db_artist, db_album)
+    p_artist, p_track = _split_artist_title(title)
+    if p_track:
+        add(p_track, p_artist, db_album)
+    # Title-only / track-only last — lrclib & NetEase can still match on the song name.
+    add(db_track or _clean_music_hint(title) or client_track, "", "")
+    return cands
+
+
 def _parse_synced_lyrics(text: str | None) -> list[dict]:
     if not text:
         return []
@@ -460,7 +518,9 @@ async def _fetch_lrclib_lyrics(track: str, artist: str, album: str = "") -> dict
 
     headers = {"User-Agent": "YTFrontend/1.0"}
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        # lrclib egresses through the shared Mullvad exit and routinely takes 6-8s;
+        # an 8s ceiling was timing out real hits and surfacing them as "not found".
+        async with httpx.AsyncClient(timeout=18.0, follow_redirects=True) as client:
             response = await client.get("https://lrclib.net/api/get", params=params, headers=headers)
             if response.status_code == 404:
                 response = await client.get("https://lrclib.net/api/search", params=params, headers=headers)
@@ -488,6 +548,384 @@ async def _fetch_lrclib_lyrics(track: str, artist: str, album: str = "") -> dict
         "plain_lyrics": plain_lyrics or synced_lyrics,
         "lines": lines,
     }
+
+
+# NetEase LRC files lead with credit lines ("作词 : ...", "Producer: ...") that carry real
+# timestamps; strip them so they don't render as the opening "lyric".
+_NETEASE_CREDIT_RE = re.compile(
+    r"(作词|作曲|编曲|制作人|制作|监制|出品|发行|工程|演奏|统筹|企划|策划|文案|配唱|混音|母带"
+    r"|和声|吉他|贝斯|鼓|键盘|录音|演唱|词|曲"
+    r"|Produced|Producer|Compose|Lyric|Mixing|Mix |Master|Arrang|Recorded|Engineer|Studio"
+    r"|Programming|Keyboard|Synth|Guitar|Bass|Drums|Vocal|Label)"
+    r"\s*[:：]",
+    re.IGNORECASE,
+)
+
+
+def _lyrics_norm(s: str | None) -> str:
+    return re.sub(r"[^\w\s]", " ", (s or "").lower()).strip()
+
+
+def _pick_netease_song(songs: list, track: str, artist: str) -> int | None:
+    """Choose the best-matching NetEase song id, or None if nothing matches confidently."""
+    want_t, want_a = _lyrics_norm(track), _lyrics_norm(artist)
+    if not want_t:
+        return None
+    best_id, best_title, best_artist = None, 0.0, 0.0
+    for s in songs:
+        nm = _lyrics_norm(s.get("name"))
+        if not nm:
+            continue
+        title = SequenceMatcher(None, want_t, nm).ratio()
+        arts = [_lyrics_norm(a.get("name")) for a in (s.get("artists") or [])]
+        art = max((SequenceMatcher(None, want_a, a).ratio() for a in arts if a), default=0.0) if want_a else 1.0
+        if (title, art) > (best_title, best_artist):
+            best_id, best_title, best_artist = s.get("id"), title, art
+    # Title must clearly match; a strong artist match can rescue a looser title.
+    if best_id and (best_title >= 0.6 or (best_title >= 0.45 and best_artist >= 0.6)):
+        return best_id
+    return None
+
+
+async def _fetch_netease_lyrics(track: str, artist: str, album: str = "") -> dict | None:
+    """NetEase Cloud Music — large catalogue, synced LRC, strong non-English coverage.
+
+    Reachable directly (no byparr) and fast, so it's raced alongside lrclib.
+    """
+    if not track:
+        return None
+    query = f"{artist} {track}".strip()
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}
+    try:
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+            sr = await client.get(
+                "https://music.163.com/api/search/get",
+                params={"s": query, "type": 1, "limit": 5},
+                headers=headers,
+            )
+            sr.raise_for_status()
+            songs = ((sr.json() or {}).get("result") or {}).get("songs") or []
+            # NetEase search is very fuzzy and will confidently return an unrelated song
+            # for a track it lacks — serving wrong lyrics is worse than none, so require
+            # the result's title (and artist, when known) to actually match the query.
+            song_id = _pick_netease_song(songs, track, artist)
+            if not song_id:
+                return None
+            lr = await client.get(
+                "https://music.163.com/api/song/lyric",
+                params={"id": song_id, "lv": -1, "kv": -1, "tv": -1},
+                headers=headers,
+            )
+            lr.raise_for_status()
+            data = lr.json() or {}
+    except Exception:
+        return None
+
+    lrc = ((data.get("lrc") or {}).get("lyric") or "").strip()
+    if not lrc:
+        return None
+    lines = [ln for ln in _parse_synced_lyrics(lrc) if not _NETEASE_CREDIT_RE.search(ln["text"])]
+    # Credit-only / metadata entries survive as a stray line or two; require real body.
+    if len(lines) < 4 and len("".join(ln["text"] for ln in lines)) < 40:
+        return None
+    return {
+        "track": track,
+        "artist": artist,
+        "album": album,
+        "source": "netease",
+        "synced": True,
+        "plain_lyrics": "\n".join(ln["text"] for ln in lines),
+        "lines": lines,
+    }
+
+
+async def _fetch_lyrics_ovh(track: str, artist: str) -> dict | None:
+    """lyrics.ovh — plain lyrics, decent Western coverage, no key. Last resort before Genius."""
+    if not track or not artist:
+        return None
+    url = f"https://api.lyrics.ovh/v1/{quote(artist)}/{quote(track)}"
+    try:
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            text = ((r.json() or {}).get("lyrics") or "").replace("\r\n", "\n").strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    return {
+        "track": track,
+        "artist": artist,
+        "album": "",
+        "source": "lyrics.ovh",
+        "synced": False,
+        "plain_lyrics": text,
+        "lines": [],
+    }
+
+
+# Genius plain-lyrics fallback (for tracks lrclib lacks), fetched through byparr (CT124),
+# a FlareSolverr-compatible Cloudflare solver whose egress uses the residential IP — so
+# Genius returns 200. (The old `dumb`/CT143 path stayed 403'd behind the VPN exit IP.)
+BYPARR_URL = os.environ.get("BYPARR_URL", "http://192.168.1.164:8191/v1")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_GENIUS_PATH_RE = re.compile(r'"path"\s*:\s*"(/[^"]*?-lyrics)"', re.I)
+_GENIUS_PATH_FALLBACK_RE = re.compile(r'(/[A-Za-z0-9][\w.%-]*-lyrics)\b')
+_GENIUS_CONTAINER_OPEN_RE = re.compile(r'<div[^>]*data-lyrics-container="true"[^>]*>', re.I)
+_GENIUS_EXCLUDE_OPEN_RE = re.compile(r'<div[^>]*data-exclude-from-selection="true"[^>]*>', re.I)
+_DIV_TAG_RE = re.compile(r"</?div\b[^>]*>", re.I)
+
+
+def _matching_div_end(s: str, after: int) -> int:
+    """Index where the <div> opened just before `after` is balanced-closed."""
+    depth = 1
+    for t in _DIV_TAG_RE.finditer(s, after):
+        depth += -1 if t.group().startswith("</") else 1
+        if depth == 0:
+            return t.start()
+    return len(s)
+
+
+def _strip_excluded_divs(frag: str) -> str:
+    # Genius tags non-lyric UI (contributor banner, translation list) data-exclude-from-selection.
+    while True:
+        m = _GENIUS_EXCLUDE_OPEN_RE.search(frag)
+        if not m:
+            return frag
+        cend = _matching_div_end(frag, m.end())
+        close = frag.find(">", cend)
+        frag = frag[:m.start()] + frag[(close + 1 if close != -1 else cend):]
+
+
+def _extract_genius_lyrics(page: str) -> str:
+    """Pull lyric text from Genius' data-lyrics-container divs.
+
+    Uses balanced-div scanning (not a non-greedy regex, which truncates on the nested
+    <div>/<span> markup Genius now emits and leaks the contributor header into the text).
+    """
+    parts: list[str] = []
+    for m in _GENIUS_CONTAINER_OPEN_RE.finditer(page):
+        cstart = _matching_div_end(page, m.end())
+        parts.append(_strip_excluded_divs(page[m.end():cstart]))
+    text = "\n".join(parts)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p>", "\n", text)
+    text = _HTML_TAG_RE.sub("", text)
+    text = html.unescape(text)
+    text = "\n".join(ln.rstrip() for ln in text.splitlines())
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+async def _byparr_get(url: str, timeout: float = 35.0) -> str | None:
+    """Fetch a URL through byparr's Cloudflare solver; returns rendered HTML or None."""
+    payload = {"cmd": "request.get", "url": url, "maxTimeout": 60000}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(BYPARR_URL, json=payload)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        sol = data.get("solution") or {}
+        resp = sol.get("response")
+        # byparr serves repeats from its own cache as HTTP 304 (with a valid body), so
+        # accept any 2xx/3xx — requiring exactly 200 dropped every cached re-fetch.
+        if data.get("status") != "ok" or not resp or not (200 <= (sol.get("status") or 0) < 400):
+            return None
+        return resp
+    except Exception:
+        return None
+
+
+async def _fetch_genius_lyrics(track: str, artist: str, album: str = "") -> dict | None:
+    """Fallback plain-lyrics scrape from Genius via byparr (CT124).
+
+    Genius only has unsynced lyrics, so this never yields synced `lines`. Two byparr
+    round-trips (search → lyrics page); only invoked when lrclib has no match, and the
+    caller caches the result, so the latency is paid at most once per track.
+    """
+    query = f"{artist} {track}".strip()
+    if not query:
+        return None
+
+    search_html = await _byparr_get("https://genius.com/api/search/multi?q=" + quote(query))
+    if not search_html:
+        return None
+    # byparr returns Genius' JSON rendered inside Firefox's HTML JSON viewer; strip to text.
+    search_text = html.unescape(_HTML_TAG_RE.sub("", search_html))
+    path = None
+    blob = re.search(r"\{.*\}", search_text, re.S)
+    if blob:
+        try:
+            data = json.loads(blob.group(0))
+            for sec in data.get("response", {}).get("sections", []):
+                if sec.get("type") != "song":
+                    continue
+                for hit in sec.get("hits", []):
+                    p = (hit.get("result") or {}).get("path")
+                    if p:
+                        path = p
+                        break
+                if path:
+                    break
+        except Exception:
+            path = None
+    if not path:
+        m = _GENIUS_PATH_RE.search(search_text) or _GENIUS_PATH_FALLBACK_RE.search(search_text)
+        path = m.group(1) if m else None
+    if not path:
+        return None
+
+    page = await _byparr_get("https://genius.com" + path)
+    if not page:
+        return None
+    plain = _extract_genius_lyrics(page)
+    if not plain:
+        return None
+    return {
+        "track": track,
+        "artist": artist,
+        "album": album,
+        "source": "genius",
+        "synced": False,
+        "plain_lyrics": plain,
+        "lines": [],
+    }
+
+
+# Lyrics cache — lrclib/Genius lookups are slow (byparr does two CF-solve round-trips) and
+# byparr is single-flight, so we memoize hits indefinitely and re-check misses after a TTL
+# (new lyrics get published over time).
+_LYRICS_NEG_TTL = 14 * 24 * 3600  # re-try a "not found" track after two weeks
+
+
+def _lyrics_cache_key(video_id: str, track: str, artist: str, album: str) -> str:
+    return "|".join((video_id or "", track or "", artist or "", album or "")).lower()
+
+
+def _lyrics_cache_get(key: str) -> dict | None:
+    """Return {'hit': bool, 'payload': dict|None} if cached & fresh, else None."""
+    try:
+        conn = get_db()
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS lyrics_cache ("
+                "key TEXT PRIMARY KEY, found INTEGER NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+            )
+            row = conn.execute(
+                "SELECT found, payload, created_at FROM lyrics_cache WHERE key=?", (key,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    if not row["found"] and (time.time() - row["created_at"]) > _LYRICS_NEG_TTL:
+        return None
+    payload = None
+    if row["found"] and row["payload"]:
+        try:
+            payload = json.loads(row["payload"])
+        except Exception:
+            return None
+    return {"hit": bool(row["found"]), "payload": payload}
+
+
+def _lyrics_cache_put(key: str, payload: dict | None) -> None:
+    try:
+        conn = get_db()
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS lyrics_cache ("
+                "key TEXT PRIMARY KEY, found INTEGER NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO lyrics_cache (key, found, payload, created_at) VALUES (?,?,?,?)",
+                (key, 1 if payload else 0, json.dumps(payload) if payload else None, int(time.time())),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+_GENIUS_DEADLINE = 34.0  # byparr does two CF solves (~13s each cold); bound so it can't 504
+
+
+async def _resolve_music_lyrics(candidates: list[tuple[str, str, str]], author: str = "") -> dict | None:
+    """Multi-source, multi-candidate lyrics resolution, preferring synced then plain.
+
+    lrclib + NetEase (both synced, reachable directly) are fanned out for *every*
+    candidate at once — the slow shared exit makes each ~6-8s, so concurrency keeps total
+    latency to ~one round-trip no matter how many identity guesses we try. Falls through
+    to lyrics.ovh then Genius/byparr (slowest, single-flight, time-bounded) only on a miss.
+    """
+    if not candidates:
+        return None
+
+    # Rank so the most trustworthy identity (has an artist, and not the YouTube uploader)
+    # is tried first; the uploader-as-artist guesses fall to the back.
+    author_l = (author or "").strip().lower()
+    ranked = sorted(candidates, key=lambda c: (not c[1], c[1].lower() == author_l))
+
+    async def _try(cands: list[tuple[str, str, str]]) -> tuple[dict | None, dict | None]:
+        """Race lrclib+NetEase for each candidate; return (synced_hit, best_plain).
+
+        lrclib (fast /api/get for a good identity) is awaited first so a synced hit
+        returns without blocking on the slower NetEase round-trip, which is cancelled.
+        """
+        lr_tasks = [asyncio.create_task(_fetch_lrclib_lyrics(t, a, al)) for (t, a, al) in cands]
+        ne_tasks = [asyncio.create_task(_fetch_netease_lyrics(t, a, al)) for (t, a, al) in cands]
+        plain = None
+        try:
+            for r in await asyncio.gather(*lr_tasks, return_exceptions=True):
+                if isinstance(r, dict) and r.get("synced"):
+                    return r, None
+                if isinstance(r, dict) and r.get("plain_lyrics") and plain is None:
+                    plain = r
+            for r in await asyncio.gather(*ne_tasks, return_exceptions=True):
+                if isinstance(r, dict) and r.get("synced"):
+                    return r, None
+                if isinstance(r, dict) and r.get("plain_lyrics") and plain is None:
+                    plain = r
+            return None, plain
+        finally:
+            for t in ne_tasks + lr_tasks:
+                if not t.done():
+                    t.cancel()
+
+    # Phase 1: the single best candidate alone — the common case (good identity) hits
+    # lrclib directly here in one round-trip, so we don't pay for fanning out wrong guesses.
+    hit, plain = await _try(ranked[:1])
+    if hit:
+        return hit
+    # Phase 2 (miss only): fan out the remaining guesses concurrently.
+    if len(ranked) > 1:
+        hit2, plain2 = await _try(ranked[1:])
+        if hit2:
+            return hit2
+        plain = plain or plain2
+    if plain:
+        return plain
+
+    # Plain-only fallbacks: prefer a candidate that has an artist and isn't the uploader.
+    for (t, a, _al) in ranked:
+        if not a:
+            continue
+        ovh = await _fetch_lyrics_ovh(t, a)
+        if ovh and ovh.get("plain_lyrics"):
+            return ovh
+        break  # one attempt — ovh coverage doesn't vary across artist spellings
+
+    gt, ga, _ = ranked[0]
+    try:
+        genius = await asyncio.wait_for(_fetch_genius_lyrics(gt, ga), timeout=_GENIUS_DEADLINE)
+    except (asyncio.TimeoutError, Exception):
+        genius = None
+    if genius and genius.get("plain_lyrics"):
+        return genius
+    return None
 
 
 def _fix_thumbs(obj):
@@ -3110,21 +3548,37 @@ async def music_lyrics(
     artist: str | None = None,
     album: str | None = None,
 ):
-    """Optional query params override identity (e.g. current virtual track inside a full-album upload)."""
-    if track or artist:
-        query_track = (track or "").strip()
-        query_artist = (artist or "").strip()
-        query_album = (album or "").strip()
-    else:
-        q_track, q_artist, q_album, title, author = _lookup_music_identity(video_id)
-        if not q_track and not q_artist:
-            q_track, q_artist, q_album, title, author = await _lookup_music_identity_from_api(video_id)
+    """Query params are *hints* (e.g. a virtual track inside a full-album upload); the
+    curated library row and the title's 'Artist - Track' split are always tried too, since
+    the player frequently passes the YouTube uploader as the artist."""
+    client_track = (track or "").strip()
+    client_artist = (artist or "").strip()
+    client_album = (album or "").strip()
 
-        query_track = q_track or _clean_music_hint(title)
-        query_artist = q_artist or _clean_music_hint(author)
-        query_album = (q_album or "").strip()
+    db_track, db_artist, db_album, title, author = _lookup_music_identity(video_id)
+    if not db_track and not db_artist and not client_track and not client_artist:
+        db_track, db_artist, db_album, title, author = await _lookup_music_identity_from_api(video_id)
 
-    lyrics = await _fetch_lrclib_lyrics(query_track, query_artist, query_album)
+    cache_key = _lyrics_cache_key(video_id, client_track, client_artist, client_album)
+    cached = _lyrics_cache_get(cache_key)
+    if cached is not None:
+        if cached["payload"]:
+            return cached["payload"]
+        raise HTTPException(status_code=404, detail="Lyrics not found")
+
+    candidates = _lyrics_candidates(
+        client_track, client_artist, client_album,
+        db_track, db_artist, db_album, title, author,
+    )
+
+    # Hard overall deadline so a slow/contended byparr can never hang the request into a
+    # gateway 504; a timeout is treated as a (non-cached) miss so it retries next time.
+    try:
+        lyrics = await asyncio.wait_for(_resolve_music_lyrics(candidates, author), timeout=50.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=404, detail="Lyrics not found")
+
+    _lyrics_cache_put(cache_key, lyrics)
     if not lyrics:
         raise HTTPException(status_code=404, detail="Lyrics not found")
 
@@ -3280,6 +3734,91 @@ async def list_genres():
     ).fetchall()
     conn.close()
     return [r["genre"] for r in rows]
+
+
+# ── genre / mood / decade classifier ────────────────────────────────────────
+
+@router.get("/classify/queue")
+async def classify_queue(
+    scope: str = Query("rated"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(40, ge=1, le=200),
+):
+    """Albums to classify: rated-first (yamtrack + native ratings), or the whole
+    library when scope=all. Includes current classification + suggestion flags."""
+    scope = scope if scope in ("rated", "all") else "rated"
+    return await run_in_threadpool(
+        music_classifier.list_classification_queue, scope, page, per_page
+    )
+
+
+@router.get("/classify/vocab")
+async def classify_vocab():
+    """Existing genre + mood vocabulary for the classifier UI autocomplete."""
+    return await run_in_threadpool(music_classifier.get_vocabulary)
+
+
+class ClassifySuggestBody(BaseModel):
+    album_key: str | None = None
+    artist: str = ""
+    album: str = ""
+    refresh: bool = False
+
+
+@router.post("/classify/suggest")
+async def classify_suggest(body: ClassifySuggestBody):
+    """Hybrid genre/mood/decade suggestion for one album (cached). Candidate tags
+    from external APIs, normalized against existing vocabulary by ollama."""
+    artist = (body.artist or "").strip()
+    album = (body.album or "").strip()
+    album_key = (body.album_key or "").strip() or normalize_album_key(album, artist)
+    if not album_key:
+        raise HTTPException(status_code=422, detail="album/artist or album_key is required")
+    return await music_classifier.suggest_for_album(album_key, artist, album, refresh=body.refresh)
+
+
+@router.post("/classify/suggest-all")
+async def classify_suggest_all(scope: str = Query("rated")):
+    """Kick off a server-side background run that suggests genre/mood for every
+    not-yet-suggested album in scope (resumable — cached albums are skipped)."""
+    scope = scope if scope in ("rated", "all") else "rated"
+    return music_classifier.start_bulk(scope)
+
+
+@router.get("/classify/suggest-all/status")
+async def classify_suggest_all_status():
+    return music_classifier.bulk_status()
+
+
+@router.post("/classify/suggest-all/stop")
+async def classify_suggest_all_stop():
+    return music_classifier.stop_bulk()
+
+
+class ClassifyApplyBody(BaseModel):
+    album_key: str | None = None
+    artist: str = ""
+    album: str = ""
+    genres: list[str] = []
+    moods: list[str] = []
+    decade: str | None = None
+    year: int | None = None
+    cover_art: str | None = None
+
+
+@router.post("/classify/apply")
+async def classify_apply(body: ClassifyApplyBody):
+    """Persist genre/mood/decade for an album (album-level + inherited by any
+    matching library tracks via the existing meta-tag groups)."""
+    artist = (body.artist or "").strip()
+    album = (body.album or "").strip()
+    album_key = (body.album_key or "").strip() or normalize_album_key(album, artist)
+    if not album_key:
+        raise HTTPException(status_code=422, detail="album/artist or album_key is required")
+    return await run_in_threadpool(
+        music_classifier.apply_classification,
+        album_key, artist, album, body.genres, body.moods, body.decade, body.year, body.cover_art,
+    )
 
 
 class MusicLibraryGenreBody(BaseModel):
@@ -3446,7 +3985,15 @@ async def music_library_artists(
     finally:
         conn.close()
 
-    return {"artists": [dict(r) for r in rows]}
+    from backend.services import cover_art
+    artists = []
+    for r in rows:
+        d = dict(r)
+        # Real artist photo (Deezer/iTunes, cached, never YouTube); None until the
+        # backfill worker resolves it — the UI shows a placeholder, not a /vi/ thumb.
+        d["image"] = cover_art.peek("artist", cover_art.artist_key(d.get("artist") or ""), d.get("artist") or "")
+        artists.append(d)
+    return {"artists": artists}
 
 
 @router.get("/library/albums")
@@ -3533,7 +4080,22 @@ async def music_library_albums(
     finally:
         conn.close()
 
-    return {"albums": [dict(r) for r in rows]}
+    from backend.services import cover_art
+    albums = []
+    for r in rows:
+        d = dict(r)
+        artist = d.get("artist") or ""
+        title = d.get("title") or ""
+        cover = cover_art.peek("album", cover_art.album_key(artist, title), artist, title)
+        if not cover:
+            # The query's thumbnail is COALESCE(ar.cover_art, ml.thumbnail); keep a
+            # real stored album sleeve, but never a YouTube (/vi/) thumbnail.
+            th = d.get("thumbnail") or ""
+            if th and "/vi/" not in th:
+                cover = th
+        d["cover_art"] = cover
+        albums.append(d)
+    return {"albums": albums}
 
 
 @router.get("/library")

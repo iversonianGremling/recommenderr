@@ -14,6 +14,7 @@ from backend.db import (
     set_video_media_override,
     get_invidious_cache,
     set_invidious_cache,
+    get_db,
 )
 from backend.services.invidious_client import api_get, api_get_cached
 from backend.services.music_client import (
@@ -209,6 +210,41 @@ async def _build_album_track_markers(data: dict) -> tuple[list[dict], str]:
     return markers, source
 
 
+def _music_library_identity(video_id: str) -> dict:
+    """Curated track/artist/album from the user's music_library, if present."""
+    try:
+        conn = get_db()
+        try:
+            row = conn.execute(
+                "SELECT track, artist, album FROM music_library WHERE video_id = ? LIMIT 1",
+                (video_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+    if not row:
+        return {}
+    out: dict = {}
+    for key in ("track", "artist", "album"):
+        val = (row[key] or "").strip() if row[key] else ""
+        if val:
+            out[key] = val
+    return out
+
+
+def _apply_music_identity(payload: dict, video_id: str) -> None:
+    """Overlay the curated library track/artist/album so the player shows the real
+    artist, not the YouTube uploader (e.g. 'Manny' for a Jorge Ben track). Filled only
+    where YouTube's own music metadata is missing, so official-music tags still win."""
+    ident = _music_library_identity(video_id)
+    if not ident:
+        return
+    for key, val in ident.items():
+        if not (payload.get(key) or "").strip():
+            payload[key] = val
+
+
 async def _build_video_payload(video_id: str, data: dict, formats: list[dict], subtitles: list[dict]) -> dict:
     media_override = get_video_media_override(video_id)
     album_track_markers, album_track_markers_source = await _build_album_track_markers(data)
@@ -218,7 +254,7 @@ async def _build_video_payload(video_id: str, data: dict, formats: list[dict], s
         for t in data.get("videoThumbnails", [])
     ]
 
-    return {
+    payload = {
         "id": video_id,
         "title": data.get("title"),
         "description": data.get("description"),
@@ -244,6 +280,8 @@ async def _build_video_payload(video_id: str, data: dict, formats: list[dict], s
         "album_track_markers": album_track_markers,
         "album_track_markers_source": album_track_markers_source,
     }
+    _apply_music_identity(payload, video_id)
+    return payload
 
 
 def _parse_invidious_formats(data: dict, video_id: str) -> list[dict]:
@@ -452,6 +490,7 @@ async def video_info(video_id: str):
     _cached_payload = get_invidious_cache(_payload_cache_key)
     if _cached_payload is not None:
         _cached_payload["media_override"] = get_video_media_override(video_id)
+        _apply_music_identity(_cached_payload, video_id)
         return _cached_payload
 
     inv_err_str: str | None = None

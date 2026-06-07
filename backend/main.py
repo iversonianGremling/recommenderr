@@ -71,12 +71,21 @@ def init_db() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Tables for the music-category recommender aren't in schema.sql.
+    from backend.services.music_category_recs import init_music_category_recs_db
+    init_music_category_recs_db()
+    from backend.services.cover_art import init_cover_cache_db
+    init_cover_cache_db()
+    from backend.services.music_classifier import init_classification_db
+    init_classification_db()
     tasks = []
     if not DISABLE_WORKERS:
         from backend.services.crawler import crawl_worker
         from backend.services.music_worker import music_worker
         from backend.services.artist_release_worker import artist_release_worker
         from backend.services.category_recs import category_recs_worker
+        from backend.services.music_category_recs import music_category_recs_worker
+        from backend.services.cover_art import cover_backfill_worker
 
         from backend.services.persona_worker import persona_worker
         tasks = [
@@ -87,6 +96,8 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(category_recs_worker(1)),
             asyncio.create_task(category_recs_worker(2)),
             asyncio.create_task(category_recs_worker(3)),
+            asyncio.create_task(music_category_recs_worker()),
+            asyncio.create_task(cover_backfill_worker()),
             asyncio.create_task(persona_worker()),
         ]
     # Warm the feed cache in the background so first requests are instant.
@@ -113,13 +124,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from backend.routers import invidious, video, music, comments, radio, admin, artists, auth, ppr, crawl, items, sources, personas, modules, graphs, pipeline_export, pipeline_consumers, signal_sources, graph_sources, feed_named, fetch, library_recs  # noqa: E402
+from backend.routers import invidious, video, music, comments, radio, admin, artists, auth, ppr, crawl, items, sources, personas, modules, graphs, pipeline_export, pipeline_consumers, signal_sources, graph_sources, feed_named, fetch, library_recs, video_categories, music_categories  # noqa: E402
 
 # Versioned API paths (internal / new clients)
 app.include_router(invidious.router, prefix="/v1/invidious", tags=["invidious"])
 app.include_router(video.router,     prefix="/v1/video",     tags=["video"])
 app.include_router(music.router,     prefix="/v1/music",     tags=["music"])
 app.include_router(library_recs.router, prefix="/v1/music",  tags=["library-recs"])
+app.include_router(music_categories.router, prefix="/v1/music/categories", tags=["music-categories"])
+app.include_router(video_categories.router, prefix="/v1/categories", tags=["categories"])
 app.include_router(comments.router,  prefix="/v1/comments",  tags=["comments"])
 app.include_router(radio.router,     prefix="/v1/radio",     tags=["radio"])
 app.include_router(artists.router,   prefix="/v1/artists",   tags=["artists"])

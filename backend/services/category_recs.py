@@ -375,6 +375,15 @@ async def category_recs_worker(worker_id: int):
         try:
             now = time.time()
             if now - last_seed > 60:
+                # Worker 0 pulls fresh category definitions/assignments from signal
+                # sources (ytvideo) before re-seeding jobs. sync_user_data_cache has
+                # its own TTL guard, so this stays cheap.
+                if worker_id == 0:
+                    try:
+                        from backend.services.user_data_sync import sync_user_data_cache
+                        await sync_user_data_cache()
+                    except Exception as e:
+                        logger.debug("category worker: user-data sync skipped: %s", e)
                 _ensure_jobs_for_all_categories()
                 last_seed = now
 
