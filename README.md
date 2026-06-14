@@ -194,9 +194,11 @@ User-facing video state. Local library, watch history, video playlists, ratings,
 
 User-facing music state. Playlists, listening history, album & track ratings, artist follows, tags, and continue-listening. Calls `recommenderr` for enrichment, recommendations, radio, and lyrics; owns playback-session state (current track, skip history, thumbs).
 
-### Frontend (shared React tree)
+### Frontend (shared React tree) — [`ytfrontend`](https://github.com/iversonianGremling/ytfrontend)
 
-A single React + Vite + Tailwind codebase builds two SPAs from one tree:
+Lives in its own repo, [`ytfrontend`](https://github.com/iversonianGremling/ytfrontend), which doubles as
+the platform's umbrella/"get-all" entry point. A single React + Vite + Tailwind codebase builds two SPAs
+from one tree:
 
 - `vite build` → `dist/` → served at `/` (video)
 - `vite build --config vite.config.music.ts` → `dist-music/` → served at `/music/`
@@ -267,6 +269,7 @@ ytmusic/                     music frontend backend (:9003)
                         music_categories) · services · clients
 
 frontend/                    shared React+Vite tree → dist/ (video) + dist-music/ (music)
+                             ↳ its own repo: github.com/iversonianGremling/ytfrontend (umbrella)
 ```
 
 ---
