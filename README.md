@@ -1,13 +1,15 @@
 <div align="center">
 
-# yt-platform
+# recommenderr
 
-**A self-hosted YouTube & YouTube Music frontend with a recommendation engine you can actually see inside.**
+**A self-hosted, platform-agnostic recommendation engine you can see inside — and tune.**
 
-Privacy-respecting playback over [Invidious](https://github.com/iv-org/invidious), a library and feed that learn from *your* watching and listening, and a transparent, tunable recommendation pipeline — all running on your own hardware.
+Point it at any kind of content — videos, music, **articles, news, posts** — declare where the
+candidates come from and what a "good" item looks like, and it builds a personalized feed from *your*
+behavior through a transparent, tunable pipeline. No black box, no cloud, no account.
 
 [![Backend](https://img.shields.io/badge/backend-FastAPI-009688)](https://fastapi.tiangolo.com/)
-[![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite-61dafb)](https://react.dev/)
+[![Engine](https://img.shields.io/badge/engine-personalized%20PageRank-ff6f00)](#the-pipeline)
 [![Storage](https://img.shields.io/badge/storage-SQLite-003b57)](https://www.sqlite.org/)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-yes-success)](#deployment)
 [![License](https://img.shields.io/badge/license-personal-lightgrey)](#license)
@@ -15,7 +17,7 @@ Privacy-respecting playback over [Invidious](https://github.com/iv-org/invidious
 </div>
 
 ![recommenderr admin — the pipeline canvas: sources → graph → scorers → feed → consumers](docs/screenshots/pipeline.png)
-_The `recommenderr` admin UI at `/admin/` — every source, scorer, weight, and consumer as a live node-and-cable pipeline you can tune._
+_The admin UI at `/admin/` — every source, scheme, scorer, weight, and consumer as a live node-and-cable pipeline you can tune._
 
 ---
 
@@ -23,11 +25,11 @@ _The `recommenderr` admin UI at `/admin/` — every source, scorer, weight, and 
 
 - [What is this?](#what-is-this)
 - [Why](#why)
-- [Architecture](#architecture)
-- [The recommendation pipeline](#the-recommendation-pipeline)
-- [Components](#components)
+- [The pipeline](#the-pipeline)
+- [Schemes & sources](#schemes--sources)
+- [Recommending something new](#recommending-something-new)
+- [Used by — the yt-platform ecosystem](#used-by--the-yt-platform-ecosystem)
 - [Tech stack](#tech-stack)
-- [Recommendation sources](#recommendation-sources)
 - [Repository layout](#repository-layout)
 - [Deployment](#deployment)
 - [Development](#development)
@@ -38,29 +40,147 @@ _The `recommenderr` admin UI at `/admin/` — every source, scorer, weight, and 
 
 ## What is this?
 
-**yt-platform** is a personal, three-service stack that turns YouTube and YouTube Music into a private, self-hosted experience:
+**recommenderr** is a general recommendation engine. Its data model is a **generic item store** with
+user-definable **schemes** (content types): you declare a scheme's fields, and items go into a
+JSON-backed table the rest of the engine treats uniformly. Everything downstream — graphs, scoring,
+the ranked feed — is generic over those items (`compute_ppr` is generic over string keys).
 
-- 🎬 **Watch** YouTube without ads, tracking, or an account — streams are fetched through your own [Invidious](https://github.com/iv-org/invidious) instance.
-- 🎵 **Listen** with a full music client: playlists, ratings, history, gapless playback, endless radio, lyrics, and now-playing.
-- 🧠 **Get recommendations that you control.** A dedicated recommendation engine builds a personalized feed and radio from your own library — and exposes every source, weight, and scorer in a visual pipeline you can tune.
+It ships with four pre-built schemes — `yt_video`, `music_track`, `music_album`, `music_artist` — and a
+source pack tuned for YouTube + music, because that's the ecosystem it was built for. But none of that
+is baked in: declare an `article`, `news_story`, or `post` scheme, wire up sources of the right kind,
+and the same pipeline recommends those instead. **As long as it's configured properly, it'll recommend
+anything.**
 
-Unlike a single monolithic app, the heavy "talk to the outside world" logic lives in one service (`recommenderr`), while the two user-facing frontends (`ytvideo`, `ytmusic`) own only *your* state. The recommender's flakiness — rate limits, broken third-party APIs — can never take down the player.
-
-> **Note on the name:** `yt-platform` is the umbrella name (it matches the nginx site that fronts everything). The three services are `recommenderr`, `ytvideo`, and `ytmusic`.
+> **recommenderr is standalone.** The **yt-platform** ecosystem — [`ytvideo`](https://github.com/iversonianGremling/ytvideo),
+> [`ytmusic`](https://github.com/iversonianGremling/ytmusic), and the [`ytfrontend`](https://github.com/iversonianGremling/ytfrontend)
+> SPA — is the *reference set of consumers* built on top of it (see [below](#used-by--the-yt-platform-ecosystem)).
+> The engine itself doesn't know or care what it's recommending.
 
 ## Why
 
-Most self-hosted YouTube frontends stop at "play the video without ads." This project goes further:
+Most recommenders are either a black box you can't inspect or hard-wired to one platform. This one is
+neither:
 
-- **Recommendations are a first-class, debuggable system, not a black box.** The aggregator has its own admin UI — a node-and-cable canvas where you can watch what each source returns, adjust weights, enable/disable scorers, and see *why* a given item was recommended.
-- **The recommender owns the external world; the frontends own user state.** This separation keeps the player fast and resilient, and makes the rec/data layer reusable if a fourth consumer ever appears (a mobile companion, a CLI…).
-- **Everything is yours.** Your watch history, ratings, playlists, and listening sessions live in local SQLite databases on your own machine.
+- **Recommendations are a first-class, debuggable system.** The engine has a visual admin — a
+  node-and-cable canvas where you watch what each source returns, adjust weights, enable/disable
+  scorers, and see *why* a given item was recommended (`GET /why/{id}`).
+- **Domain lives at the edges, not the core.** Only *sources* and *schemes* know about a domain, and
+  both are declarative. The candidate-generation, graph, and scoring layers are content-agnostic and
+  reusable across any consumer.
+- **Everything is yours.** Your behavior, items, and ranked feeds live in local SQLite on your own
+  machine. Nothing is sent to an analytics or cloud service.
 
 ---
 
-## Architecture
+## The pipeline
 
-Three FastAPI services behind one nginx site, plus an Invidious instance for actual YouTube egress.
+`recommenderr` is built as an explicit left-to-right pipeline. The admin UI renders it as the
+interactive canvas shown above; the same model is below. It's the same five stages no matter what the
+items *are*.
+
+```mermaid
+flowchart LR
+    subgraph INPUTS["1 · INPUTS"]
+        direction TB
+        SIG["Signal sources<br/>your behavior: history · ratings · saves<br/><i>(user-addable)</i>"]
+        SRC["Content sources<br/>APIs · scrapers · feeds · extractors<br/><i>(code-declared, UI-configured)</i>"]
+    end
+
+    NORM["2 · NORMALIZE<br/>mapping executor<br/>raw source JSON → uniform items (per scheme)"]
+
+    subgraph GRAPHS["3 · GRAPHS"]
+        direction TB
+        G1["one graph<br/>per scheme"]
+        G2["(songs · videos · albums<br/>artists · <i>articles · …</i>)"]
+    end
+
+    subgraph SCORE["4 · SCORE"]
+        direction TB
+        PPR["PPR<br/>(primary)"]
+        COS["Cosine<br/>(embeddings)"]
+        SER["Serendipity"]
+        MOD["Custom modules<br/>(sandboxed)"]
+    end
+
+    OUT["5 · OUTPUT<br/>MMR diversity · per-source caps<br/>filters · weight rules"]
+    FEED["FEED<br/>precomputed ranked list"]
+    CONS["CONSUMERS<br/>any app that reads the feed"]
+
+    SIG --> NORM
+    SRC --> NORM
+    NORM --> GRAPHS
+    GRAPHS --> SCORE
+    SCORE --> OUT
+    OUT --> FEED
+    FEED --> CONS
+```
+
+1. **Inputs** — *signal sources* (your behavior: views, ratings, saves, playlists) and *content
+   sources* (third-party APIs, scrapers, RSS feeds, extractors). Signal sources are user-addable;
+   content sources are code-declared and only *configured* (enable, weight, credentials).
+2. **Normalize** — the mapping executor maps each source's raw JSON into the uniform item shape its
+   scheme declares. Some sources run passthrough.
+3. **Graphs** — one personalized-PageRank graph per scheme.
+4. **Score** — **PPR** is the primary scorer, with optional **Cosine** (Ollama embeddings, Rocchio),
+   **Serendipity**, and **custom sandboxed modules** blended in. Per-listener **personas** can be
+   scored independently. Every scorer's enabled-state and weight is visible and tunable.
+5. **Output → Feed → Consumers** — diversity/dedup/filtering produce a precomputed ranked feed that any
+   consumer reads. A per-graph feed-generation counter lets consumers detect a recompute and re-warm
+   their caches.
+
+> **Explainability:** every recommendation can answer *"why am I seeing this?"* — the engine traces the
+> seeds and weights that produced each item (`GET /why/{id}`), surfaced as a panel with per-seed
+> boost/block controls.
+
+---
+
+## Schemes & sources
+
+**Schemes** are the content types. The item store is a generic JSON-backed table; a scheme just
+declares which fields an item of that type has. Four are pre-built (`yt_video`, `music_track`,
+`music_album`, `music_artist`) and you can add more from the UI.
+
+**Sources** are code-declared (`source_registry.py`) as `SourceDecl`s with a `kind` — `api`,
+`scraper`, `extractor`, `feed`, or `feedback`. The UI can enable, weight, and credential them, but only
+code adds new ones. Each has its own weight, rate limit, and circuit-breaker policy.
+
+The **bundled source pack** (music + video) is what ships configured:
+
+| Source       | Kind     | Default weight | Credentials       |
+| ------------ | -------- | -------------- | ----------------- |
+| Spotify      | api      | 1.00           | client id/secret  |
+| Deezer       | api      | 0.90           | —                 |
+| Last.fm      | api      | 0.85           | API key           |
+| MusicBrainz  | api      | 0.80           | —                 |
+| Bandcamp     | scraper  | 0.70           | —                 |
+| Discogs      | api      | 0.60           | token             |
+| iTunes       | api      | 0.55           | —                 |
+| Invidious    | extractor| —              | — (your instance) |
+| yt-dlp       | extractor| —              | —                 |
+| YouTube RSS  | feed     | —              | —                 |
+| user signals | feedback | —              | —                 |
+
+## Recommending something new
+
+To point the engine at a different domain — say, articles or news:
+
+1. **Declare a scheme** for the item type in the admin UI (its fields: title, url, published, tags…).
+2. **Add sources** of the right `kind` — the `feed` kind already covers RSS/Atom; an `api` or
+   `scraper` source covers everything else (register it in `source_registry.py`).
+3. **Pick seeds** — signal sources (reads, saves, ratings) feed PPR the same way watch history does.
+4. Tune weights and scorers on the canvas. The graph, PPR, cosine, serendipity, and output stages need
+   no changes — they're generic over items.
+
+The music/video specifics (enrichment, Invidious proxy, radio) are *consumer* features layered on top,
+not part of the core engine.
+
+---
+
+## Used by — the yt-platform ecosystem
+
+`recommenderr` was built for, and is the brain of, **yt-platform** — a self-hosted YouTube & YouTube
+Music frontend. This is the reference deployment: three FastAPI services behind one nginx site, plus an
+Invidious instance for YouTube egress.
 
 ```mermaid
 flowchart LR
@@ -73,7 +193,7 @@ flowchart LR
     NGINX(["nginx · yt-platform"])
 
     subgraph ct134["CT134 · ytfrontend"]
-        REC["recommenderr<br/>:9001<br/>aggregator + rec engine"]
+        REC["recommenderr<br/>:9001<br/>the engine (this repo)"]
         VID["ytvideo<br/>:9002<br/>library · feed · subs"]
         MUS["ytmusic<br/>:9003<br/>playlists · ratings · radio state"]
     end
@@ -98,115 +218,17 @@ flowchart LR
     REC --> OLLAMA
 ```
 
-**Routing at a glance** (nginx site `yt-platform`):
+| Consumer | Repo | Port | Role |
+| --- | --- | --- | --- |
+| **ytvideo** | [iversonianGremling/ytvideo](https://github.com/iversonianGremling/ytvideo) | `:9002` | Video user state — library, feed, subscriptions, mpv; reads the feed, delegates fetch/scoring here |
+| **ytmusic** | [iversonianGremling/ytmusic](https://github.com/iversonianGremling/ytmusic) | `:9003` | Music user state — playlists, ratings, radio state; calls here for recs, radio, lyrics, enrichment |
+| **Frontend** | [iversonianGremling/ytfrontend](https://github.com/iversonianGremling/ytfrontend) | static | Shared React tree → two SPAs (`/` video, `/music/` music); also the platform's umbrella repo |
 
-| Path                         | → Service        | Purpose                                              |
-| ---------------------------- | ---------------- | --------------------------------------------------- |
-| `/`                          | static SPA       | Video frontend                                      |
-| `/music/`                    | static SPA       | Music frontend                                      |
-| `/api/local/`, `/api/mpv/`   | ytvideo `:9002`  | Library, feed, subscriptions, playback              |
-| `/api/music/`                | ytmusic `:9003`  | Playlists, history, ratings, continue-listening     |
-| `/api/`, `/v1/`, `/admin/`   | recommenderr `:9001` | Video/search/Invidious proxy, recs, admin UI    |
-
----
-
-## The recommendation pipeline
-
-`recommenderr` is built as an explicit left-to-right pipeline. Its admin UI renders this as an interactive node-and-cable canvas; the same model is shown below.
-
-```mermaid
-flowchart LR
-    subgraph INPUTS["1 · INPUTS"]
-        direction TB
-        SIG["Signal sources<br/>watch history · ratings · playlists<br/><i>(addable)</i>"]
-        SRC["Content sources<br/>Last.fm · Deezer · MusicBrainz<br/>Invidious · Bandcamp · …<br/><i>(code-declared)</i>"]
-    end
-
-    NORM["2 · NORMALIZE<br/>converters + mapping<br/>raw API JSON → uniform records"]
-
-    subgraph GRAPHS["3 · GRAPHS"]
-        direction TB
-        G1["Songs"]
-        G2["Videos"]
-        G3["Albums"]
-        G4["Artists"]
-    end
-
-    subgraph SCORE["4 · SCORE"]
-        direction TB
-        PPR["PPR<br/>(primary)"]
-        COS["Cosine<br/>(embeddings)"]
-        SER["Serendipity"]
-    end
-
-    OUT["5 · OUTPUT<br/>MMR diversity · max-per-channel<br/>filters · weight rules"]
-    FEED["FEED<br/>precomputed ranked list"]
-
-    subgraph CONS["CONSUMERS"]
-        direction TB
-        C1["ytvideo feed"]
-        C2["ytmusic radio"]
-        C3["category recs"]
-    end
-
-    SIG --> NORM
-    SRC --> NORM
-    NORM --> GRAPHS
-    GRAPHS --> SCORE
-    SCORE --> OUT
-    OUT --> FEED
-    FEED --> CONS
-```
-
-The five stages:
-
-1. **Inputs** — *signal sources* (your behavior: watches, ratings, playlists) and *content sources* (third-party music/video APIs and scrapers). Signal sources are user-addable; content sources are code-declared and only *configured* (enable, weight, credentials).
-2. **Normalize** — converters map each source's raw JSON into the uniform record shape the graph needs. Some sources run passthrough.
-3. **Graphs** — one personalized-PageRank graph per content type (Songs / Videos / Albums / Artists).
-4. **Score** — **PPR** is the primary scorer, with optional **Cosine** (Ollama embeddings, Rocchio), **Serendipity**, and **custom sandboxed modules** blended in. Per-listener **personas** can be scored independently. Every scorer's enabled-state and weight is visible and tunable.
-5. **Output → Feed → Consumers** — diversity/dedup/filtering produce a precomputed ranked feed, which the frontends read. A per-graph feed-generation counter lets consumers detect a recompute and re-warm their caches.
-
-> **Explainability:** every recommendation can answer *"why am I seeing this?"* — the engine traces the seeds and weights that produced each item (`GET /why/{id}`), surfaced as a panel in the UI with per-seed boost/block controls.
-
----
-
-## Components
-
-### `recommenderr` — aggregator + recommendation engine `:9001`
-
-The brain. Owns all external integrations, all recommendation logic, third-party API keys, and rate limiters. Serves the admin UI at `/admin/`.
-
-- Personalized-PageRank feed/radio engine (`ppr_engine.py`)
-- Optional embedding (cosine, Ollama/Rocchio) and serendipity scorers
-- **Custom scoring modules** — user-defined scorers run in a sandboxed `RestrictedPython` engine and added to the pipeline at runtime
-- **Listener personas** — multiple taste profiles, each with its own seeds/weights, scored independently
-- Invidious proxy (recommendations, trending, comments, storyboards)
-- Music enrichment & recognition (MusicBrainz, Last.fm, Deezer, Discogs, Bandcamp, iTunes, Spotify)
-- Genre/mood/decade music classifier (vocab-constrained, Ollama-assisted)
-- Source **crawler** for proactive catalog expansion, plus favorites/ratings → tags & genres sync
-- Per-source rate limiters, circuit breakers, health tracking, and **VPN exit rotation** (`exit_manager`)
-- Per-video / per-track response caching with feed-generation invalidation
-- In-library radio, category recommendations, keyword suppression
-- Visual pipeline admin UI (sources, weights, scorers, modules, consumers)
-
-### `ytvideo` — video frontend backend `:9002`
-
-User-facing video state. Local library, watch history, video playlists, ratings, tags, categories, subscriptions (RSS), Google Takeout import, and mpv control. Delegates every YouTube/Invidious fetch and the feed scoring to `recommenderr`.
-
-### `ytmusic` — music frontend backend `:9003`
-
-User-facing music state. Playlists, listening history, album & track ratings, artist follows, tags, and continue-listening. Calls `recommenderr` for enrichment, recommendations, radio, and lyrics; owns playback-session state (current track, skip history, thumbs).
-
-### Frontend (shared React tree) — [`ytfrontend`](https://github.com/iversonianGremling/ytfrontend)
-
-Lives in its own repo, [`ytfrontend`](https://github.com/iversonianGremling/ytfrontend), which doubles as
-the platform's umbrella/"get-all" entry point. A single React + Vite + Tailwind codebase builds two SPAs
-from one tree:
-
-- `vite build` → `dist/` → served at `/` (video)
-- `vite build --config vite.config.music.ts` → `dist-music/` → served at `/music/`
-
-State via Zustand, routing via React Router, icons via lucide-react.
+On top of the generic engine, the yt-platform deployment also leans on `recommenderr`'s consumer-side
+features: Invidious proxy, music enrichment & recognition (MusicBrainz / Last.fm / Deezer / Discogs /
+Bandcamp / iTunes / Spotify), a genre/mood/decade classifier, a source crawler, per-source rate
+limiters & circuit breakers with VPN exit rotation, in-library radio, category recs, and keyword
+suppression.
 
 ---
 
@@ -216,98 +238,57 @@ State via Zustand, routing via React Router, icons via lucide-react.
 | ------------ | ------------------------------------------------------------------- |
 | Backend      | Python 3 · FastAPI · Uvicorn · httpx · Pydantic v2                  |
 | Recsys       | Personalized PageRank · cosine (Ollama embeddings) · serendipity    |
-| Media        | yt-dlp · Invidious + invidious-companion · mpv                      |
-| Scraping     | BeautifulSoup · RestrictedPython (sandboxed source modules)         |
-| Rate limits  | pyrate-limiter · requests-ratelimiter · per-source circuit breakers |
-| Storage      | SQLite (WAL) — one DB per service                                   |
-| Frontend     | React 18 · Vite 6 · TypeScript · Tailwind · Zustand · React Router  |
-| Auxiliary    | Ollama (CT115) for embeddings + classification                     |
+| Extensibility| Generic item store + UI-declared schemes · sandboxed scoring modules (RestrictedPython) |
+| Scraping     | BeautifulSoup · per-source rate limits & circuit breakers           |
+| Storage      | SQLite (WAL)                                                         |
+| Admin UI     | React · Vite · a node-and-cable pipeline canvas                     |
+| Auxiliary    | Ollama for embeddings + classification                             |
 | Deploy       | Proxmox LXC · systemd · nginx                                       |
-
----
-
-## Recommendation sources
-
-Sources are **code-declared** (`source_registry.py`) — the UI can enable, weight, and credential them, but only code can add new ones. Each has its own weight, rate limit, and circuit-breaker policy.
-
-| Source       | Kind     | Default weight | Credentials       |
-| ------------ | -------- | -------------- | ----------------- |
-| Spotify      | API      | 1.00           | client id/secret  |
-| Deezer       | API      | 0.90           | —                 |
-| Last.fm      | API      | 0.85           | API key           |
-| MusicBrainz  | API      | 0.80           | —                 |
-| Bandcamp     | scraper  | 0.70           | —                 |
-| Discogs      | API      | 0.60           | token             |
-| iTunes       | API      | 0.55           | —                 |
-| Invidious    | extractor| —              | — (your instance) |
-| yt-dlp       | extractor| —              | —                 |
-| YouTube RSS  | feed     | —              | —                 |
-| user signals | internal | —              | —                 |
 
 ---
 
 ## Repository layout
 
-Each service is a self-contained FastAPI app deployed to its own directory on CT134.
-
 ```
-recommenderr/                aggregator + rec engine (:9001)
+recommenderr/
 ├── backend/
 │   ├── main.py
-│   ├── routers/             video, music, radio, admin, ppr, sources, graphs, …
-│   ├── services/            ppr_engine, embedding_engine, source_registry,
-│   │                        music_classifier, category_recs, radio_*, crawler, …
+│   ├── routers/             generic pipeline: items, schemes, sources, signal_sources,
+│   │                        graphs, graph_sources, ppr, modules, personas, pipeline_*,
+│   │                        admin · plus the yt/music consumers (video, music, radio, …)
+│   ├── services/            ppr_engine, embedding_engine, serendipity_engine, module_engine,
+│   │                        mapping_executor, source_registry, feed_cache, persona_engine,
+│   │                        + music/video integrations (invidious, ytdlp, music_*, crawler …)
 │   ├── clients/
 │   ├── db/  schema.sql
 │   └── tests/
 ├── admin-ui/                React pipeline-canvas admin (builds to dist/)
+├── docs/screenshots/
 └── requirements.txt
-
-ytvideo/                     video frontend backend (:9002)
-└── backend/  routers/ (feed, subscriptions, playlists, history, ratings,
-                        tags, categories, imports, mpv) · services · clients
-
-ytmusic/                     music frontend backend (:9003)
-└── backend/  routers/ (playlists, history, ratings, artists, tags,
-                        music_categories) · services · clients
-
-frontend/                    shared React+Vite tree → dist/ (video) + dist-music/ (music)
-                             ↳ its own repo: github.com/iversonianGremling/ytfrontend (umbrella)
 ```
 
 ---
 
 ## Deployment
 
-Runs as three `systemd` services inside a Proxmox LXC (CT134), fronted by nginx, with Invidious in a separate container (CT133).
+Runs as a `systemd` service. In the reference yt-platform deployment it sits inside a Proxmox LXC
+(CT134) fronted by nginx, alongside its consumers `ytvideo` (`:9002`) and `ytmusic` (`:9003`).
 
 ```bash
-# Each service: a FastAPI app started from its own directory
 #   recommenderr.service  →  python -m backend.main   (cwd /opt/recommenderr, :9001)
-#   ytvideo.service       →  python -m backend.main   (cwd /opt/ytvideo,      :9002)
-#   ytmusic.service       →  python -m backend.main   (cwd /opt/ytmusic,      :9003)
-
-systemctl restart recommenderr ytvideo ytmusic
-systemctl status  recommenderr ytvideo ytmusic
-```
-
-Build the frontends from the shared tree:
-
-```bash
-cd frontend
-npm install
-npm run build:all       # → dist/ (video) and dist-music/ (music)
+systemctl restart recommenderr
+systemctl status  recommenderr
 ```
 
 Build the admin UI:
 
 ```bash
-cd recommenderr/admin-ui
+cd admin-ui
 npm install && npm run build   # → dist/, served by recommenderr at :9001/admin/
 ```
 
-After changing PPR seed weights, **restart `recommenderr` and recompute** so the
-precomputed feed picks them up:
+After changing PPR seed weights, **restart and recompute** so the precomputed feed picks them up
+(in the yt-platform deployment this is triggered through nginx):
 
 ```bash
 curl -X POST http://127.0.0.1/api/local/feed/recompute
@@ -317,40 +298,28 @@ curl -X POST http://127.0.0.1/api/local/feed/recompute
 
 ## Development
 
-Each backend uses `pytest`:
-
 ```bash
-cd recommenderr && python -m pytest      # also: ytvideo/, ytmusic/
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+python -m backend.main      # serves on :9001
+python -m pytest            # run tests
 ```
 
-Frontend:
-
-```bash
-cd frontend
-npm run dev          # video SPA
-npm run dev:music    # music SPA
-npm run test         # vitest
-npm run lint
-```
-
-Configuration is via environment variables / `.env` per service (e.g. `DB_PATH`,
-`LISTEN_HOST`, `LISTEN_PORT`, `DISABLE_WORKERS`, and per-source API credentials).
+Configuration is via environment variables / `.env` (e.g. `DB_PATH`, `LISTEN_HOST`, `LISTEN_PORT`,
+`DISABLE_WORKERS`, and per-source API credentials).
 
 ---
 
 ## Privacy & egress
 
-- All YouTube playback and metadata fetching is proxied through your own
-  **Invidious** instance (with `invidious-companion` for PO tokens); the browser
-  never talks to Google directly.
-- Recommendation egress (recs, trending, InnerTube `browse`/`next`) is routed
-  through Invidious / privoxy → Tor, and outbound source calls share a VPN exit.
-- Per-source **rate limiters and circuit breakers** keep third-party APIs from
-  being hammered and protect against IP bans; responses are cached aggressively.
-- Lyrics resolution falls back through a Cloudflare solver (byparr) without
-  changing your VPN path.
-- Your data — history, ratings, playlists, listening sessions — stays in local
-  SQLite files. Nothing is sent to an analytics or cloud service.
+- Your data — behavior, items, ranked feeds — stays in local SQLite. Nothing is sent to an analytics or
+  cloud service.
+- Outbound source calls go through **per-source rate limiters and circuit breakers** to protect against
+  IP bans; responses are cached aggressively, with feed-generation invalidation.
+- In the yt-platform deployment, all YouTube playback/metadata is proxied through your own **Invidious**
+  instance, recommendation egress is routed through Invidious / privoxy → Tor, and outbound source
+  calls share a VPN exit (`exit_manager`).
 
 ---
 
@@ -361,5 +330,5 @@ Personal / self-hosted project. No public license granted — adapt for your own
 ---
 
 <div align="center">
-<sub>Built for a homelab. Inspired by Invidious, Piped, and FreeTube — extended with a recommendation engine you can open up and tune.</sub>
+<sub>A recommendation engine you can open up and tune — point it at videos, music, or anything else you can declare a source for.</sub>
 </div>
