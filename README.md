@@ -14,6 +14,9 @@ Privacy-respecting playback over [Invidious](https://github.com/iv-org/invidious
 
 </div>
 
+![recommenderr admin — the pipeline canvas: sources → graph → scorers → feed → consumers](docs/screenshots/pipeline.png)
+_The `recommenderr` admin UI at `/admin/` — every source, scorer, weight, and consumer as a live node-and-cable pipeline you can tune._
+
 ---
 
 ## Table of contents
