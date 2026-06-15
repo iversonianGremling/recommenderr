@@ -117,10 +117,19 @@ async def _do_refresh(graph_id: int) -> None:
             )
 
         items = await loop.run_in_executor(None, _compute)
-        _snapshots[graph_id] = _Snapshot(items=items, computed_at=time.monotonic())
-        bump_generation(graph_id)
-        logger.info("feed_cache: graph %d refreshed %d items (gen %d)",
-                    graph_id, len(items), get_generation(graph_id))
+        prev = _snapshots.get(graph_id)
+        if not items and prev and prev.items:
+            # A transient recompute can yield 0 items (e.g. a refresh racing the
+            # graph-1 feed_recommendations prune, or a momentary seed gap). Don't
+            # let that blank the feed for a whole REFRESH_INTERVAL — keep the last
+            # good snapshot and try again on the next cycle.
+            logger.warning("feed_cache: graph %d refresh produced 0 items; keeping previous %d (gen %d)",
+                           graph_id, len(prev.items), get_generation(graph_id))
+        else:
+            _snapshots[graph_id] = _Snapshot(items=items, computed_at=time.monotonic())
+            bump_generation(graph_id)
+            logger.info("feed_cache: graph %d refreshed %d items (gen %d)",
+                        graph_id, len(items), get_generation(graph_id))
     except Exception as exc:
         logger.warning("feed_cache: graph %d refresh failed: %s", graph_id, exc)
     finally:
